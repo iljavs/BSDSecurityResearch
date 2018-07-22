@@ -1,0 +1,1526 @@
+possible proc pointer use after free in midiioctl
+
+midiioctl() saves the current proc pointer when it receives a FIOASYNC ioctl. at a later time a signal can be send to it. 
+However, if the process passes that fd to a different process (e.g. pass fd over socket or fork/execve) and then exits, the proc pointer is expired! 
+
+if the signal is then send later on, an expired proc pointer will be used. this can cause a panic and possible elevation of privilege. 
+
+obsd\sys\dev\Midi.c 
+int
+midiioctl(dev_t dev, u_long cmd, caddr_t addr, int flag, struct proc *p)
+{
+	struct midi_softc *sc;
+	int error;
+
+	sc = (struct midi_softc *)device_lookup(&midi_cd, minor(dev));
+	if (sc == NULL)
+		return ENXIO;
+	error = 0;
+	switch(cmd) {
+	case FIONBIO:
+		/* All handled in the upper FS layer */
+		break;
+	case FIOASYNC:
+		if (*(int *)addr) {
+			if (sc->async) {
+				error = EBUSY;
+				goto done;
+			}
+			sc->async = p; <-- sends sig to proc in midi interrupt. What if fd is send to other process and this process is dead 
+		} else
+			sc->async = 0;
+		break;
+	default:
+		error = ENOTTY;
+	}
+done:
+	device_unref(&sc->dev);
+	return error;
+}
+
+fix: like nbsd, save pid instead. (technically there's still a race, where a signal could be send to a wrong process, fixing that requires (significantly?) more code churn)
+fixed in netbsd checkin 73:
+Revision 1.73 / (download) - annotate - [select for diffs], Wed Nov 23 23:07:31 2011 UTC (5 years, 4 months ago) by jmcneill 
+Branch: MAIN 
+Changes since 1.72: +461 -498 lines
+Diff to previous 1.72 (colored)
+
+Merge jmcneill-audiomp3 branch, which is derived from ad-audiomp2. From
+the original ad-audiomp branch notes:
+
+  Add MP locking to the audio drivers.
+
+  Making the audio drivers MP safe is necessary before efforts
+  can be made to make the VM system MP safe.
+
+  The are two locks per device instance, an ISR lock and
+  a character device lock. The ISR lock replaces calls to
+  splaudio()/splx(), and will be held across calls to device
+  methods which were called at splaudio() before (e.g.
+  trigger_output). The character device lock is held across
+  calls to nearly all of the methods, excluding some only
+  used for initialization, e.g. get_locks.
+
+Welcome to 5.99.57.
+--------------------------------------------------------------------------------------------------------
+division by zero in vndioctl
+
+vndioctl() takes data from userland and uses it in a division. the divisor is usercontrolled and never checked for 0. 
+can cause a division by zero leading to a kernel panic. 
+
+obsd\sys\dev\Vnd.c 
+int
+vndioctl(dev_t dev, u_long cmd, caddr_t addr, int flag, struct proc *p)
+{
+...
+	vio = (struct vnd_ioctl *)addr;
+	switch (cmd) {
+
+	case VNDIOCSET:
+...
+		sc->sc_secsize = vio->vnd_secsize;
+...
+			sc->sc_size = vattr.va_size / sc->sc_secsize; <-- division by zero 
+...
+}
+
+--------------------------------------------------------------------------------------------------------
+unbound length can be passed to malloc through sys_sendsyslog()
+
+sys_sendsyslog() takes a buffer length field that will be passed to malloc in several places. the length is never capped. 
+obsd malloc() will panic on large values, hence this issue can cause a kernel panic. 
+
+obsd\sys\kern\Subr_log.c 
+int
+sys_sendsyslog(struct proc *p, void *v, register_t *retval)
+{
+	struct sys_sendsyslog_args /* {
+		syscallarg(const void *) buf;
+		syscallarg(size_t) nbyte;
+		syscallarg(int) flags;
+	} */ *uap = v;
+	int error;
+	static int dropped_count, orig_error;
+...
+	error = dosendsyslog(p, SCARG(uap, buf), SCARG(uap, nbyte),
+	    SCARG(uap, flags), UIO_USERSPACE);
+...
+	return (error);
+}
+
+
+int
+dosendsyslog(struct proc *p, const char *buf, size_t nbyte, int flags,
+    enum uio_seg sflg)
+{
+#ifdef KTRACE
+	struct iovec *ktriov = NULL;
+	int iovlen;
+#endif
+...
+	struct iovec aiov;
+	struct uio auio;
+	size_t i, len;
+...
+	aiov.iov_base = (char *)buf;
+	aiov.iov_len = nbyte; <-- user controlled size_t. never capped anywhere 
+...
+	auio.uio_resid = aiov.iov_len;
+...
+#ifdef KTRACE
+	if (KTRPOINT(p, KTR_GENIO)) {
+		ktriov = mallocarray(auio.uio_iovcnt, sizeof(struct iovec),
+		    M_TEMP, M_WAITOK);
+		iovlen = auio.uio_iovcnt * sizeof (struct iovec);
+
+		memcpy(ktriov, auio.uio_iov, iovlen);
+	}
+#endif
+...
+	len = auio.uio_resid; <-- user controlled size_t
+	if (fp) {
+...
+	} else if (constty || cn_devvp) {
+...
+	} else {
+...
+			kbuf = malloc(len, M_TEMP, M_WAITOK); <-- large value passed to malloc(). malloc() will panic on that 
+...
+	}
+
+...
+#ifdef KTRACE
+	if (ktriov != NULL) {
+		if (error == 0)
+			ktrgenio(p, -1, UIO_WRITE, ktriov, len); <-- user controlled size_t passed to ktrgenio
+		free(ktriov, M_TEMP, iovlen);
+	}
+#endif
+...
+}
+
+obsd\sys\kern\Kern_ktrace.c 
+void
+ktrgenio(struct proc *p, int fd, enum uio_rw rw, struct iovec *iov,
+    ssize_t len)
+{
+...
+	int buflen;
+...
+	if (len > PAGE_SIZE) <-- len is signed size_t! can be negative 
+		buflen = PAGE_SIZE;
+	else
+		buflen = len + sizeof(struct ktr_genio); <-- if len is negative, buflen could be negative too 
+...
+	cp = malloc(buflen, M_TEMP, M_WAITOK); <-- negative buflen becomes really large length. malloc() will panic on that 
+...
+}
+
+--------------------------------------------------------------------------------------------------------
+unbound malloc, kernel panic, out of bound read and possible info leak in vfs_getcwd_scandir 
+
+vfs_getcwd_scandir() calls VOP_GETATTR() and VOP_READDIR() to get the data it needs from the filesystem. 
+In a fuse fs scenario, this data can be provided by userland. the blocksize provided by VOP_GETATTR is passed to malloc(). 
+if it's really big, this will cause a kernel panic. 
+
+The data it gets back from VOP_READDIR() can be malformed. for any record it contains a namelen which isn't validated. when used 
+in a copy operation it can cause an out of bound read which could cause a kernel panic or possibly cause an info leak. 
+
+desktop\obsd\sys\kern\Vfs_getcwd.c
+int
+vfs_getcwd_scandir(struct vnode **lvpp, struct vnode **uvpp, char **bpp,
+    char *bufp, struct proc *p)
+{
+	int eofflag, tries, dirbuflen, len, reclen, error = 0;
+...
+	struct vattr va;
+...
+		error = VOP_GETATTR(lvp, &va, p->p_ucred, p); <-- data can come from fusefs 
+...
+	dirbuflen = DIRBLKSIZ;
+
+	if (dirbuflen < va.va_blocksize)
+		dirbuflen = va.va_blocksize; <-- fusefs can make this really big 
+
+	dirbuf = malloc(dirbuflen, M_TEMP, M_WAITOK); <-- malloc() will panic on very large values 
+...
+	do {
+		char   *cpos;
+		struct dirent *dp;
+
+		iov.iov_base = dirbuf;
+		iov.iov_len = dirbuflen;
+...
+		error = VOP_READDIR(uvp, &uio, p->p_ucred, &eofflag); <-- fusefs can provide arbitrary content 
+...
+		cpos = dirbuf;
+...
+		for (len = (dirbuflen - uio.uio_resid); len > 0;
+		     len -= reclen) {
+			dp = (struct dirent *)cpos;
+			reclen = dp->d_reclen;
+
+			/* Check for malformed directory */
+			if (reclen < DIRENT_RECSIZE(1)) {
+				error = EINVAL;
+				goto out;
+			}
+
+			if (dp->d_fileno == fileno) {
+				char *bp = *bpp;
+				bp -= dp->d_namlen; <-- fusefs can lie about d_namlen
+
+				if (bp <= bufp) {
+					error = ERANGE;
+					goto out;
+				}
+
+				memmove(bp, dp->d_name, dp->d_namlen); <-- fusefs can lie about d_namlen, can cause out of bound read, which could either panic or infoleak
+				error = 0;
+				*bpp = bp;
+
+				goto out;
+			}
+
+			cpos += reclen;
+		}
+
+	} while (!eofflag);
+...
+}
+
+--------------------------------------------------------------------------------------------------------
+info leak in recvit() 
+
+recvit() is an ipc function used to receive data. When performing ktrace, there is some possible alignment that occurs. 
+The bytes that would be aligned do not get initialized, but do get copied to ktrace'ed data. this can cause an info leak. 
+
+obsd\sys\kern\Uipc_syscalls.c 
+int
+recvit(struct proc *p, int s, struct msghdr *mp, caddr_t namelenp,
+    register_t *retsize)
+{
+...
+	if (mp->msg_control) {
+		len = mp->msg_controllen;
+		if (len <= 0 || control == NULL)
+			len = 0;
+		else {
+			struct mbuf *m = control;
+			caddr_t cp = mp->msg_control;
+
+			do {
+				i = m->m_len;
+				if (len < i) {
+					mp->msg_flags |= MSG_CTRUNC;
+					i = len;
+				}
+				error = copyout(mtod(m, caddr_t), cp, i);
+				if (m->m_next)
+					i = ALIGN(i); <-- aligned i can be larger than  m->m_len 
+				cp += i;
+				len -= i;
+				if (error != 0 || len <= 0)
+					break;
+#ifdef KTRACE
+				if (KTRPOINT(p, KTR_STRUCT) && i)
+					ktrcmsghdr(p, mtod(m, char *), i); <-- would possibly infoleak aligned data
+#endif
+			} while ((m = m->m_next) != NULL);
+			len = cp - (caddr_t)mp->msg_control;
+		}
+		mp->msg_controllen = len;
+	}
+...
+}
+
+-----------------------------------------------------------------------------------------------------
+info leak in ieee80211_ioctl() 
+the ieee80211_ioctl() ioctl handler function will handle the SIOCG80211ALLNODES ioctl. it fills out a 
+ieee80211_nodereq struct and then copies it to userland. the structure isn't memset'ed and several elments 
+of the struct aren't initialized. when copied to userland the uninitialized elements will leak uninitialized 
+kernel data to userland. 
+
+obsd\sys\net80211\Ieee80211_ioctl.h 
+/* node and requests */
+struct ieee80211_nodereq {
+	char		nr_ifname[IFNAMSIZ];		/* e.g. "ath0" */   <-- doesn't get initialized 
+
+	/* Node address and name information */
+	u_int8_t	nr_macaddr[IEEE80211_ADDR_LEN];	/* node lladdr */
+	u_int8_t	nr_bssid[IEEE80211_ADDR_LEN];	/* bssid */
+	u_int8_t	nr_nwid_len;			/* ESSID length */
+	u_int8_t	nr_nwid[IEEE80211_NWID_LEN];	/* ESSID */
+
+	/* Channel and rates */
+	u_int16_t	nr_channel;			/* last channel */
+	u_int16_t	nr_chan_flags;			/* channel flags */
+	u_int8_t	nr_nrates;			/* rate count */
+	u_int8_t	nr_rates[IEEE80211_RATE_MAXSIZE];	/* rate set */
+
+	/* Node status information */
+	int8_t		nr_rssi;	/* received signal strength */
+	int8_t		nr_max_rssi;	/* maximum rssi */
+	u_int8_t	nr_tstamp[8];	/* from last received beacon */
+	u_int16_t	nr_intval;	/* beacon interval */
+	u_int16_t	nr_capinfo;	/* capabilities */
+	u_int16_t	nr_fhdwell;	/* FH only */     <-- not initialized 
+	u_int8_t	nr_fhindex;	/* FH only */     <-- not initialized
+	u_int8_t	nr_erp;		/* 11g only */
+	u_int8_t	nr_pwrsave;	/* power saving mode */
+	u_int16_t	nr_associd;	/* assoc response */
+	u_int16_t	nr_txseq;	/* seq to be transmitted */
+	u_int16_t	nr_rxseq;	/* seq previous received */
+	u_int32_t	nr_fails;	/* failure count to associate */
+	u_int32_t	nr_inact;	/* inactivity mark count */
+	u_int8_t	nr_txrate;	/* index to nr_rates[] */
+	u_int16_t	nr_state;	/* node state in the cache */
+
+	/* RSN */
+	u_int		nr_rsnprotos;
+	u_int		nr_rsnciphers;
+	u_int		nr_rsnakms;
+
+	/* Node flags */
+	u_int8_t	nr_flags;
+
+	/* HT */
+	uint16_t		nr_htcaps;
+	uint8_t			nr_rxmcs[howmany(80,NBBY)];
+	uint16_t		nr_max_rxrate;	/* in Mb/s, 0 <= rate <= 1023 */
+	uint8_t			nr_tx_mcs_set;
+	uint8_t			nr_txmcs;
+};
+
+
+obsd\sys\net80211\Ieee80211_ioctl.c 
+int
+ieee80211_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
+{
+	struct ieee80211com *ic = (void *)ifp;
+	struct ifreq *ifr = (struct ifreq *)data;
+...
+	struct ieee80211_nodereq *nr, nrbuf; <-- nrbuf not initialized 
+...
+	switch (cmd) {
+...
+	case SIOCG80211ALLNODES:
+		na = (struct ieee80211_nodereq_all *)data;
+		na->na_nodes = i = 0;
+		ni = RBT_MIN(ieee80211_tree, &ic->ic_tree);
+		while (ni && na->na_size >=
+		    i + sizeof(struct ieee80211_nodereq)) {
+			ieee80211_node2req(ic, ni, &nrbuf); <-- nrbuf not entirely initialized 
+			error = copyout(&nrbuf, (caddr_t)na->na_node + i,
+			    sizeof(struct ieee80211_nodereq));  <-- info leak 
+			if (error)
+				break;
+			i += sizeof(struct ieee80211_nodereq);
+			na->na_nodes++;
+			ni = RBT_NEXT(ieee80211_tree, ni);
+		}
+		break;
+...
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+
+memory leak in bp_getfile()
+
+bp_getfile() calls xdr_string_encode() which allocates an mbuf, copies data into it, and returns the mbuf pointer. On failure (e.g. OOM) 
+it will return NULL. xdr_string_encode() is called twice. the first one allocates the first mbuf, and the 2nd call allocates the 
+2nd mbuf in the mbuf chain. If the second call fails (but the first one succeeds), the error is detected, and bp_getfile() bails out, 
+however, it doesn't free the original mbuf, leading to a memory leak. 
+
+obsd\sys\nfs\Nfs_boot.c 
+static int
+bp_getfile(struct sockaddr_in *bpsin, char *key, struct sockaddr_in *md_sin,
+    char *serv_name, char *pathname, int retries)
+{
+	struct mbuf *m;
+...
+	m  = xdr_string_encode(hostname, hostnamelen);
+	if (m == NULL)
+		return (ENOMEM);
+
+	/* key name (root or swap) */
+	m->m_next = xdr_string_encode(key, strlen(key));
+	if (m->m_next == NULL)
+		return (ENOMEM);  <-- leaks m. should "goto bad;" instead. 
+...
+}
+ 
+---------------------------------------------------------------------------------------------------------------------------
+Missing check to see if mbuf cluster is successfully allocated. 
+
+et_newbuf() is called to allocate an mbuf. Depending on the size it's given, it will either simply allocate an mbuf (if the size is small enough) or (if the size is larger)
+it will allocate an mbuf and then allocate an mbuf cluster. it is possible that the cluster allocation fails. Checking cluster allocation failure is done by checking the mbuf 
+for the M_EXT flag. This doesn't happen in et_newbuf, and its simply assumed that the cluster allocation succeeds. this leads to an mbuf with a size that is not correct (in case of failure). 
+
+obsd\sys\dev\pci\If_et.c 
+int
+et_newbuf(struct et_rxbuf_data *rbd, int buf_idx, int init, int len0)
+{
+	struct et_softc *sc = rbd->rbd_softc;
+	struct et_rxdesc_ring *rx_ring;
+	struct et_rxdesc *desc;
+	struct et_rxbuf *rb;
+	struct mbuf *m;
+	bus_dmamap_t dmap;
+	int error, len;
+
+	KKASSERT(buf_idx < ET_RX_NDESC);
+	rb = &rbd->rbd_buf[buf_idx];
+
+	if (len0 >= MINCLSIZE) {
+		MGETHDR(m, init ? M_WAITOK : M_DONTWAIT, MT_DATA);
+		if (m == NULL)
+			return (ENOBUFS);
+		MCLGET(m, init ? M_WAITOK : M_DONTWAIT); 
+		len = MCLBYTES; <-- this seems wrong. if MCLGET() fails, m is still valid, but you need to check for M_EXT. so in case of failure, the assumed length is too big!
+	} else {
+		MGETHDR(m, init ? M_WAITOK : M_DONTWAIT, MT_DATA);
+		len = MHLEN;
+	}
+
+	if (m == NULL) {
+		error = ENOBUFS;
+
+		/* XXX for debug */
+		printf("%s: M_CLGET failed, size %d\n", sc->sc_dev.dv_xname,
+		    len0);
+		if (init) {
+			return error;
+		} else {
+			goto back;
+		}
+	}
+	m->m_len = m->m_pkthdr.len = len; <-- incorrect mbuf size in case MCLGET() failed. 
+...
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+memory leak in iec_get()
+
+iec_get() is used to allocate an mbuf chain. a loop is used to allocate mbufs based on a length thats given as input. If the length is large enough, it will 
+allocate mbuf clusters. If allocation of an mbuf cluster fails the function returns without free'ing the recently allocated mbuf. 
+
+obsd\sys\arch\sgi\dev\If_iec.c 
+struct mbuf *
+iec_get(struct iec_softc *sc, uint8_t *data, size_t datalen)
+{
+	struct mbuf *m, **mp, *head;
+	size_t len, pad;
+
+	MGETHDR(m, M_DONTWAIT, MT_DATA);
+	if (m == NULL) {
+		printf("%s: unable to allocate RX mbuf\n",
+		    sc->sc_dev.dv_xname);
+		return NULL;
+	}
+
+	m->m_pkthdr.len = datalen;
+
+	pad = ALIGN(sizeof(struct ether_header)) - sizeof(struct ether_header);
+	m->m_data += pad;
+	len = MHLEN - pad;
+	head = NULL;
+	mp = &head;
+
+	while (datalen != 0) {
+		if (head != NULL) {
+			MGET(m, M_DONTWAIT, MT_DATA);
+			if (m == NULL) {
+				printf("%s: unable to allocate RX mbuf\n",
+				    sc->sc_dev.dv_xname);
+				m_freem(head);
+				return NULL;
+			}
+			len = MHLEN;
+		}
+		if (datalen >= MINCLSIZE) {
+			MCLGET(m, M_DONTWAIT);
+			if ((m->m_flags & M_EXT) == 0) {
+				printf("%s: unable to allocate RX cluster\n",
+				    sc->sc_dev.dv_xname);
+				m_freem(head);
+				return NULL; <-- looks like this might leak 'm'. should mfreem(m) before returning. 
+			}
+			len = MCLBYTES;
+			if (head == NULL) {
+				m->m_data += pad;
+				len -= pad;
+			}
+		}
+		m->m_len = len = min(datalen, len);
+		memcpy(mtod(m, caddr_t), data, len);
+		data += len;
+		datalen -= len;
+		*mp = m;
+		mp = &m->m_next;
+	}
+
+	return head;
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+double free in vte_init() / vte_init_tx_ring() / vte_stop()
+
+vte_init() is called when setting up the vte interface (e.g. SIOCSIFADDR ioctl). it calls vte_init_tx_ring() to allocate some tx mbufs. if that function fails, it calls 
+vte_stop() to get rid of everything that had been set up so far. 
+
+There is an error corner case in vte_init_tx_ring() where an mbuf is allocated, and it's cluster allocation fails. In which case it free's the mbuf, but does not set it to NULL. 
+when vte_init_tx_ring() returns and vte_stop() is called, it will free that same mbuf again, leading to a double free. 
+
+obsd\sys\dev\pci\If_vte.c 
+int
+vte_init(struct ifnet *ifp)
+{
+	struct vte_softc *sc = ifp->if_softc;
+...
+	error = vte_init_tx_ring(sc); 
+	if (error != 0) {
+		printf("%s: no memory for Tx buffers.\n", sc->sc_dev.dv_xname);
+		vte_stop(sc);
+		return (error);
+	}
+...
+}
+
+int
+vte_init_tx_ring(struct vte_softc *sc)
+{
+...
+	for (i = 0; i < VTE_TX_RING_CNT; i++) {
+		MGETHDR(sc->vte_cdata.vte_txmbufs[i], 
+		    M_DONTWAIT, MT_DATA);
+		if (sc->vte_cdata.vte_txmbufs[i] == NULL)
+			return (ENOBUFS);
+		MCLGET(sc->vte_cdata.vte_txmbufs[i], M_DONTWAIT);
+		if (!(sc->vte_cdata.vte_txmbufs[i]->m_flags & M_EXT)) {
+			m_freem(sc->vte_cdata.vte_txmbufs[i]);  <-- need to set sc->vte_cdata.vte_txmbufs[i] to NULL before returning
+			return (ENOBUFS);
+		}
+...
+	}
+...
+	return (0);
+}
+
+void
+vte_stop(struct vte_softc *sc)
+{
+...
+	/* Free TX mbuf pools used for deep copy. */
+	for (i = 0; i < VTE_TX_RING_CNT; i++) {
+		if (sc->vte_cdata.vte_txmbufs[i] != NULL) {
+			m_freem(sc->vte_cdata.vte_txmbufs[i]); <-- can double free here 
+			sc->vte_cdata.vte_txmbufs[i] = NULL;
+		}
+	}
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+useless error logic in swofp_action_output_controller() to check if an mbuf cluster allocation succeeds can never happen
+
+swofp_action_output_controller() allocates an mbuf, and if need be an mbuf cluster (if the len to be copied to the mbuf is larger than what fits in an mbuf). 
+it calls MCLGET() to allocate the mbuf cluster, and then checks if the mbuf m is NULL to see if the mbuf cluster allocation succeeded. This is not how you 
+check for mbuf cluster allocation failure! you're supposed to check the M_EXT flag of the mbuf. This check is faulty and the condition being checked 
+for can never happen.
+
+If the length can be large enough, and the mbuf cluster allocation fails, this could cause mbuf memory corruption. 
+
+obsd\sys\net\Switchofp.c 
+int
+swofp_action_output_controller(struct switch_softc *sc, struct mbuf *m0,
+    struct swofp_pipeline_desc *swpld , uint16_t frame_max_len, uint8_t reason)
+{
+...
+	struct mbuf			*m;
+	caddr_t				 tail;
+	int				 match_len;
+...
+	MGETHDR(m, M_DONTWAIT, MT_DATA);
+	if (m == NULL) {
+		m_freem(m0);
+		return (ENOBUFS);
+	}
+	if ((sizeof(*pin) + match_len) >= MHLEN) {
+		MCLGET(m, M_DONTWAIT);
+		if (m == NULL) { <-- this is busted and can NEVER happen. m is still valid if MCLGET fails. need to check M_EXT instead. 
+			m_freem(m0);
+			return (ENOBUFS);
+		}
+	}
+...
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+unchecked nam mbuf len in tcp_usrreq() PRU_CONNECT case 
+
+in the PRU_CONNECT case in tcp_usrreq() it's assumed that the nam mbuf is of a certain length. userland can submit a nam that is shorter. In wihch case 
+the function would be operating on unitialized mbuf data. 
+
+additionally, there is no error handling if the nam mbuf address isn't of type AF_INET6 or AF_INET. 
+
+obsd\sys\netinet\Tcp_usrreq.c 
+int
+tcp_usrreq(struct socket *so, int req, struct mbuf *m, struct mbuf *nam, <-- nam mbuf content comes from userland. it's content can be 1-255 bytes long
+    struct mbuf *control, struct proc *p)
+{
+...
+	inp = sotoinpcb(so);
+...
+	if (inp) {
+		tp = intotcpcb(inp);
+...
+		}
+...
+	switch (req) {
+...
+	case PRU_CONNECT:
+		sin = mtod(nam, struct sockaddr_in *);
+
+#ifdef INET6
+		if (sin->sin_family == AF_INET6) { <-- need to check mbuf len before touching sin, can operate on unitialized mbuf data
+			struct in6_addr *in6_addr = &mtod(nam,
+			    struct sockaddr_in6 *)->sin6_addr;
+
+			if (IN6_IS_ADDR_UNSPECIFIED(in6_addr) ||
+			    IN6_IS_ADDR_MULTICAST(in6_addr) ||
+			    IN6_IS_ADDR_V4MAPPED(in6_addr)) {
+				error = EINVAL;
+				break;
+			}
+
+			error = in6_pcbconnect(inp, nam);
+		} else if (sin->sin_family == AF_INET)  <-- need to check mbuf len before touching sin, can operate on unitialized mbuf data
+#endif /* INET6 */
+		{
+			if ((sin->sin_addr.s_addr == INADDR_ANY) ||
+			    (sin->sin_addr.s_addr == INADDR_BROADCAST) ||
+			    IN_MULTICAST(sin->sin_addr.s_addr) ||
+			    in_broadcast(sin->sin_addr, inp->inp_rtableid)) {
+				error = EINVAL;
+				break;
+			}
+
+			error = in_pcbconnect(inp, nam);
+		} <-- shouldn't there be an else error case here? if not AF_INET and not AF_INET6, then the tcp control block has no idea who the destination is. 
+
+		if (error)
+			break;
+
+		tp->t_template = tcp_template(tp);
+		if (tp->t_template == 0) {
+			in_pcbdisconnect(inp);
+			error = ENOBUFS;
+			break;
+		}
+
+		so->so_state |= SS_CONNECTOUT;
+
+		/* Compute window scaling to request.  */
+		tcp_rscale(tp, sb_max);
+
+		soisconnecting(so);
+		tcpstat_inc(tcps_connattempt);
+		tp->t_state = TCPS_SYN_SENT;
+		TCP_TIMER_ARM(tp, TCPT_KEEP, tcptv_keep_init);
+		tcp_set_iss_tsm(tp);
+		tcp_sendseqinit(tp);
+#if defined(TCP_SACK)
+		tp->snd_last = tp->snd_una;
+#endif
+#if defined(TCP_SACK) && defined(TCP_FACK)
+		tp->snd_fack = tp->snd_una;
+		tp->retran_data = 0;
+		tp->snd_awnd = 0;
+#endif
+		error = tcp_output(tp);
+		break;
+...
+	}
+...
+	return (error);
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+race condition in sosplice() can cause a memory leak
+
+sosplice() modifies a socket object (so) without holding a socket lock. It assigns a pointer allocated wity pool_get to so->so_sp. the pool_get can wait. 
+
+here's how this could cause a leak: 
+1) thread1 gets to sosplice. does so->so_sp = pool_get(&sosplice_pool, PR_WAITOK | PR_ZERO); 
+2) no memory directly available, thread1 sleeps
+3) thread2 gets to sosplice on same socket. does so->so_sp = pool_get(&sosplice_pool, PR_WAITOK | PR_ZERO); 
+4) thread2 sleeps too 
+5) thread 1 wakes up, gets a valid pointer, assigns it to so->so_sp, finishes what it's doing and returns 
+6) thread 2 wakes up, gets a valid pointer, assigns it to so->so_sp. overwriting the previous so->so_sp and leaking that memory allocation 
+
+obsd\sys\kern\Uipc_socket.c 
+int
+sosplice(struct socket *so, int fd, off_t max, struct timeval *tv)
+{
+...
+	if (so->so_sp == NULL) <-- shouldn't this happen under a solock(so)? otherwise there could be a race where a memory leak would occur ....
+		so->so_sp = pool_get(&sosplice_pool, PR_WAITOK | PR_ZERO); 
+...
+	if ((error = getsock(curproc, fd, &fp)) != 0)
+		return (error);
+	sosp = fp->f_data;
+	if (sosp->so_sp == NULL) <-- shouldn't this happen under a solock(sosp)? otherwise there could be a race where a memory leak would occur ....
+		sosp->so_sp = pool_get(&sosplice_pool, PR_WAITOK | PR_ZERO);  
+...
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+potential info leak when sendto'ing on a SOCK_DGRAM unix domain socket 
+
+When doing a sendto() on a unix domain socket, you have to pass along the name you're sending data to. the name is passed in a 
+struct sockaddr_un structure (first byte length, 2nd byte family, next 104 bytes are a path). the kernel copies this data from user memory 
+to kernel memory (into an mbuf) and doesn't validate it's content untill it reached unp_connect(). 
+
+unp_connect() doesn't check to see if the buffer is at least small enough to contain a length and a familiy (2 bytes long). This can lead to 
+operating on unitialized data, and possible infoleak when the uninitialized path is used (leaked through ktrace). 
+
+obsd\sys\kern\Uipc_syscalls.c 
+int
+sendit(struct proc *p, int s, struct msghdr *mp, int flags, register_t *retsize)
+{
+...
+		error = sockargs(&to, mp->msg_name, mp->msg_namelen,
+		    MT_SONAME); <-- copies from userland into an mbuf (to). length can be 0-255 bytes 
+...
+	error = sosend(fp->f_data, to, &auio, NULL, control, flags);
+...
+}
+
+obsd\sys\kern\Uipc_socket.c 
+int
+sosend(struct socket *so, struct mbuf *addr, struct uio *uio, struct mbuf *top,
+    struct mbuf *control, int flags)
+{
+...
+			error = (*so->so_proto->pr_usrreq)(so,
+			    (flags & MSG_OOB) ? PRU_SENDOOB : PRU_SEND,
+			    top, addr, control, curproc);
+...
+}
+
+obsd\sys\kern\Uipc_usrreq.c 
+int
+uipc_usrreq(struct socket *so, int req, struct mbuf *m, struct mbuf *nam,
+    struct mbuf *control, struct proc *p)
+{
+...
+	switch (req) {
+...
+	case PRU_SEND:
+		if (control && (error = unp_internalize(control, p)))
+			break;
+		switch (so->so_type) {
+
+		case SOCK_DGRAM: {
+...
+				error = unp_connect(so, nam, p);
+...
+			break;
+		}
+...
+		break;
+...
+	}
+...
+	return (error);
+}
+
+obsd\sys\kern\Uipc_usrreq.c 
+int
+unp_connect(struct socket *so, struct mbuf *nam, struct proc *p)
+{
+	struct sockaddr_un *soun = mtod(nam, struct sockaddr_un *);
+	struct vnode *vp;
+	struct socket *so2, *so3;
+	struct unpcb *unp, *unp2, *unp3;
+	struct nameidata nd;
+	int error;
+
+	if (soun->sun_family != AF_UNIX) <-- need to verify nam->m_len is at least large enough to contain sun_family. else operating on inititialized data 
+		return (EAFNOSUPPORT);
+
+	if (nam->m_len < sizeof(struct sockaddr_un)) <-- if m_len is really small ...
+		*(mtod(nam, caddr_t) + nam->m_len) = 0; <-- this write will occur before the start of the sun_path buffer 
+	else if (nam->m_len > sizeof(struct sockaddr_un))
+		return (EINVAL);
+	else if (memchr(soun->sun_path, '\0', sizeof(soun->sun_path)) == NULL) <-- uninitialized sun_path buffer should have a 0-byte in it somewhere 
+		return (EINVAL);
+
+	NDINIT(&nd, LOOKUP, FOLLOW | LOCKLEAF, UIO_SYSSPACE, soun->sun_path, p);
+	nd.ni_pledge = PLEDGE_UNIX;
+	if ((error = namei(&nd)) != 0) <-- sun_path can infoleak through ktrace
+		return (error);
+...
+}
+
+
+obsd\sys\kern\Vfs_lookup.c 
+int
+namei(struct nameidata *ndp)
+{
+...
+		error = copystr(ndp->ni_dirp, cnp->cn_pnbuf,
+			    MAXPATHLEN, &ndp->ni_pathlen); <-- thats the sun_path content
+...
+#ifdef KTRACE
+	if (KTRPOINT(cnp->cn_proc, KTR_NAMEI))
+		ktrnamei(cnp->cn_proc, cnp->cn_pnbuf); <-- infoleak 
+#endif
+...
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+uninitialized kernel data can be send over the network when doing a sendto() on a raw socket 
+
+When perfoming a sendto() or a raw socket, a sockaddr_in struct is passed along, and copied to an mbuf. There is no check to see 
+if the structure length is long enough. If the length is sufficiently small, rip_usrreq() will simply assume it's large enough and 
+copy over the sockaddr_in sin_addr from the nam mbuf. if the length is small enough this will be uninitialized mbuf data that will
+be used as the destionation address. Given that this data will be send over the network, there is an infoleak here. 
+
+obsd\sys\netinet\Raw_ip.c 
+int
+rip_usrreq(struct socket *so, int req, struct mbuf *m, struct mbuf *nam,
+    struct mbuf *control, struct proc *p)
+{
+...
+	switch (req) {
+...
+	case PRU_SEND:
+	    {
+		struct sockaddr_in dst;
+
+		memset(&dst, 0, sizeof(dst));
+		dst.sin_family = AF_INET;
+		dst.sin_len = sizeof(dst);
+		if (so->so_state & SS_ISCONNECTED) {
+			if (nam) {
+				error = EISCONN;
+				break;
+			}
+			dst.sin_addr = inp->inp_faddr;
+		} else {
+			if (nam == NULL) {
+				error = ENOTCONN;
+				break;
+			}
+			dst.sin_addr =
+			    mtod(nam, struct sockaddr_in *)->sin_addr; <-- need to check if nam->m_len is large enough. else this will use uninitialized mbuf data as the destination address 
+		}
+...
+		error = rip_output(m, so, sintosa(&dst), NULL); <-- uninitialized destination address send over the network 
+		m = NULL;
+		break;
+	    }
+...
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+info leak in sys_ptrace() syscall 
+
+In the PT_READ_I/PT_READ_D case of sys_ptrace() a local stack variable (temp) is returned in retval[0] after a call to process_domem(). temp is not initialized, and will only get initialized 
+by process_domem(). if process_domem() fails, temp is never initialized, but still copied to retval[0]. this uninitialized value can be queried with ktrace, hence leading to a uninitialized stack 
+data info leak. 
+
+obsd\sys\kern\Sys_process.c 
+int
+sys_ptrace(struct proc *p, void *v, register_t *retval)
+{
+...
+	int temp; <-- uninitialized variable 
+...
+	switch (req) {
+...
+	case  PT_READ_I:		/* XXX no separate I and D spaces */
+	case  PT_READ_D:
+		/* write = 0 done above. */
+		iov.iov_base = (caddr_t)&temp;
+		iov.iov_len = sizeof(int);
+		uio.uio_iov = &iov;
+		uio.uio_iovcnt = 1;
+		uio.uio_offset = (off_t)(vaddr_t)addr;
+		uio.uio_resid = sizeof(int);
+		uio.uio_segflg = UIO_SYSSPACE;
+		uio.uio_rw = write ? UIO_WRITE : UIO_READ;
+		uio.uio_procp = p;
+		error = process_domem(p, tr, &uio, write ? PT_WRITE_I :
+				PT_READ_I); <-- if process_domem() fails, temp doesn't get written to
+		if (write == 0)
+			*retval = temp; <-- unitialized temp is written to retval[0]. can be leaked to userland with ktrace 
+		return (error);
+...
+	}
+...
+	return 0;
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+info leak in sys_fcntl() syscall
+
+In the fcntl F_GETOWN case of sys_fcntl() a local stack variable (tmp) is returned in retval[0] after an TIOCGPGRP ioctl is performed on the current file pointer. 
+tmp is not initialized, and will only get initialized by the ioctl call. if the ioctl call fails (e.g. ttioctl()), tmp is never initialized, but still copied to retval[0]. this 
+uninitialized value can be queried with ktrace, hence leading to a uninitialized stack data info leak. 
+
+obsd\sys\kern\Kern_descrip.c 
+int
+sys_fcntl(struct proc *p, void *v, register_t *retval)
+{
+...
+	int i, tmp, newmin, flg = F_POSIX; <-- tmp is uninitialized int 
+...
+	switch (SCARG(uap, cmd)) {
+...
+	case F_GETOWN:
+		if (fp->f_type == DTYPE_SOCKET) {
+			*retval = ((struct socket *)fp->f_data)->so_pgid;
+			break;
+		}
+		if (fp->f_type == DTYPE_PIPE) {
+			*retval = ((struct pipe *)fp->f_data)->pipe_pgid;
+			break;
+		}
+		error = (*fp->f_ops->fo_ioctl)
+			(fp, TIOCGPGRP, (caddr_t)&tmp, p); <-- tmp is uninitialized if the ioctl callback fails (e.g. ttioctl())
+		*retval = -tmp; <-- unitialized -tmp is written to retval[0]. can be leaked to userland with ktrace 
+		break;
+...
+	}
+...
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+
+double free in pppoe_dispatch_disc_pkt() 
+
+pppoe_dispatch_disc_pkt() handles incoming pppoe packets. it loops over a number of pppoetags. There are 3 cases that are handled 
+where a packet can contain some kind of error tag. In those cases an m_pulldown() is performed with the embedded pppoetag length fields. 
+if the m_pulldown() fails there is a call to goto done, which mfreem()s the mbuf. The problem is, if m_pulldown() fails, it will already 
+mfreem() the mbuf, hence a double free will occur.
+
+obsd\sys\net\If_pppoe.c 
+/* Analyze and handle a single received packet while not in session state. */
+static void pppoe_dispatch_disc_pkt(struct mbuf *m, int off)
+{
+...
+	int noff, err, errortag;
+	u_int16_t *max_payload;
+	u_int16_t tag, len;
+...
+	while (off + sizeof(*pt) <= m->m_pkthdr.len) {
+		n = m_pulldown(m, off, sizeof(*pt), &noff);
+...
+		pt = (struct pppoetag *)(mtod(n, caddr_t) + noff);
+		tag = ntohs(pt->tag);
+		len = ntohs(pt->len); 
+...
+		switch (tag) {
+...
+		case PPPOE_TAG_SNAME_ERR:
+			err_msg = "SERVICE NAME ERROR";
+			errortag = 1;
+			break;
+		case PPPOE_TAG_ACSYS_ERR:
+			err_msg = "AC SYSTEM ERROR";
+			errortag = 1;
+			break;
+		case PPPOE_TAG_GENERIC_ERR:
+			err_msg = "GENERIC ERROR";
+			errortag = 1;
+			break;
+		}
+		if (err_msg) {
+			log(LOG_INFO, "%s: %s: ", devname, err_msg);
+			if (errortag && len) {
+				n = m_pulldown(m, off, len,
+				    &noff); <-- if m_pulldown() fails, it will mfreem(m)
+				if (n) {
+					u_int8_t *et = mtod(n, caddr_t) + noff;
+					while (len--)
+						addlog("%c", *et++);
+				} <-- should have else case that sets m to NULL 
+			}
+			addlog("\n");
+			goto done;  <-- will end up mfreem(m) again 
+		}
+		off += len;
+	}
+...
+done:
+	m_freem(m); <-- possible double free!
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+potentially not enough data pulled up in ieee80211_eapol_key_input() could cause out of bound read and cause panic 
+
+ieee80211_eapol_key_input() parses an EAPOL key frame. this packet/structure contains 2 length fields, one simply called 'len' that describes the entire frames length, and one called 
+'paylen' that describes the length of the payload inside the EAPOL frame. Both are validated to make sure they fit within the frame. However, only the payload length is 
+used to pullup the mbuf. If a malformed EAPOL frame is received with a larger len than paylen (+sizeof(hdr)) it might be possible to end up with an mbuf where not enough bytes are 
+pulled up. In that case it'll be possible to read out of bound while parsing the EAPOL frame. 
+
+
+obsd\sys\net80211\Ieee80211_pae_input.c 
+void
+ieee80211_eapol_key_input(struct ieee80211com *ic, struct mbuf *m,
+    struct ieee80211_node *ni)
+{
+	struct ifnet *ifp = &ic->ic_if;
+	struct ether_header *eh;
+	struct ieee80211_eapol_key *key;
+...
+	eh = mtod(m, struct ether_header *);
+...
+	if (m->m_len < sizeof(*key) &&
+	    (m = m_pullup(m, sizeof(*key))) == NULL) {   <-- guarantees that there are sizeof(struct ieee80211_eapol_key) continuous bytes in the mbuf 
+		ic->ic_stats.is_rx_nombuf++;
+		goto done;
+	}
+...
+	key = mtod(m, struct ieee80211_eapol_key *);
+...
+	if (m->m_pkthdr.len < 4 + BE_READ_2(key->len)) <-- assume key->len is (significantly ?) larger than key->payload 
+		goto done;
+
+	/* check key data length */
+	totlen = sizeof(*key) + BE_READ_2(key->paylen);  <-- assume key->len is (significantly ?) larger than key->payload 
+	if (m->m_pkthdr.len < totlen || totlen > MCLBYTES)
+		goto done;
+...
+	/* make sure the key data field is contiguous */
+	if (m->m_len < totlen && (m = m_pullup(m, totlen)) == NULL) { <-- not enough data pulled up if key->len is larger than key->payload!
+		ic->ic_stats.is_rx_nombuf++;
+		goto done;
+	}
+	key = mtod(m, struct ieee80211_eapol_key *);
+...
+				ieee80211_recv_4way_msg3(ic, key, ni); <-- can crash in here if not enough data is pulled up.
+...
+}
+
+void
+ieee80211_recv_4way_msg3(struct ieee80211com *ic,
+    struct ieee80211_eapol_key *key, struct ieee80211_node *ni)
+{
+...
+	/* check Key MIC field using KCK */
+	if (ieee80211_eapol_key_check_mic(key, tptk.kck) != 0) { <-- can crash in here if not enough data is pulled up.
+		DPRINTF(("key MIC failed\n"));
+		ic->ic_stats.is_rx_eapol_badmic++;
+		return;
+	}
+...
+}
+
+int
+ieee80211_eapol_key_check_mic(struct ieee80211_eapol_key *key,
+    const u_int8_t *kck)
+{
+	u_int8_t mic[EAPOL_KEY_MIC_LEN];
+
+	memcpy(mic, key->mic, EAPOL_KEY_MIC_LEN);
+	memset(key->mic, 0, EAPOL_KEY_MIC_LEN);
+	ieee80211_eapol_key_mic(key, kck); <-- can crash in here if not enough data is pulled up.
+
+	return timingsafe_bcmp(key->mic, mic, EAPOL_KEY_MIC_LEN) != 0;
+}
+
+obsd\sys\net80211\Ieee80211_crypto.c 
+void
+ieee80211_eapol_key_mic(struct ieee80211_eapol_key *key, const u_int8_t *kck)
+{
+	u_int8_t digest[SHA1_DIGEST_LENGTH];
+	ANY_CTX ctx;	/* XXX off stack? */
+	u_int len;
+
+	len = BE_READ_2(key->len) + 4; <-- if key->len is larger than key->paylen, then it's possible not enough data is pulled up .... 
+
+	switch (BE_READ_2(key->info) & EAPOL_KEY_VERSION_MASK) {
+	case EAPOL_KEY_DESC_V1:
+		HMAC_MD5_Init(&ctx.md5, kck, 16);
+		HMAC_MD5_Update(&ctx.md5, (u_int8_t *)key, len); <-- could read out of bound and panic 
+		HMAC_MD5_Final(key->mic, &ctx.md5);
+		break;
+	case EAPOL_KEY_DESC_V2:
+		HMAC_SHA1_Init(&ctx.sha1, kck, 16);
+		HMAC_SHA1_Update(&ctx.sha1, (u_int8_t *)key, len);  <-- could read out of bound and panic 
+		HMAC_SHA1_Final(digest, &ctx.sha1);
+		/* truncate HMAC-SHA1 to its 128 MSBs */
+		memcpy(key->mic, digest, EAPOL_KEY_MIC_LEN);
+		break;
+	case EAPOL_KEY_DESC_V3:
+		AES_CMAC_Init(&ctx.cmac);
+		AES_CMAC_SetKey(&ctx.cmac, kck);
+		AES_CMAC_Update(&ctx.cmac, (u_int8_t *)key, len);  <-- could read out of bound and panic 
+		AES_CMAC_Final(key->mic, &ctx.cmac);
+		break;
+	}
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+Memory corruption in run_rx_frame()
+
+run_rx_frame() takes data from usb, and based on that, creates an mbuf, fills it, and passes it on to the 802.11 stack. 
+a length field is used to copy into the mbuf, without making sure the length field isn't too large. this could cause memory corruption. 
+
+With this attack surface, the idea is that a remote attacker has exploited some bug in the radio, and has code execution on the radio. 
+USB is packet based (e.g. no DMA) and doesn't do PCI, as such, the usb data shouldn't be considered trusted, especially if it comes from a radio. 
+	
+obsd\sys\dev\usb\If_run.c 
+void
+run_rx_frame(struct run_softc *sc, uint8_t *buf, int dmalen)
+{
+...
+	struct rt2860_rxwi *rxwi;
+...
+	uint16_t len;
+...
+	rxwi = (struct rt2860_rxwi *)buf;
+...
+	len = letoh16(rxwi->len) & 0xfff; <-- can be at most 4095
+...
+	/* could use m_devget but net80211 wants contig mgmt frames */
+	MGETHDR(m, M_DONTWAIT, MT_DATA);
+	if (__predict_false(m == NULL)) {
+		ifp->if_ierrors++;
+		return;
+	}
+	if (len > MHLEN) { <-- if len is 4095, come here 
+		MCLGET(m, M_DONTWAIT); <-- allocates a cluster, which is 2048 bytes long
+		if (__predict_false(!(m->m_flags & M_EXT))) {
+			ifp->if_ierrors++;
+			m_freem(m);
+			return;
+		}
+	}
+...
+	/* finalize mbuf */
+	memcpy(mtod(m, caddr_t), wh, len); <-- memory corruption!
+	m->m_pkthdr.len = m->m_len = len;
+...
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+Memory corruption in atu_rxeof()
+
+atu_rxeof() takes data from usb, and based on that, creates an mbuf, fills it, and passes it on to the 802.11 stack. 
+a length field is used to copy into the mbuf, without making sure the length field isn't too large. this could cause memory corruption. 
+additionally, there is also an integer underflow when handling this length field. 
+
+With this attack surface, the idea is that a remote attacker has exploited some bug in the radio, and has code execution on the radio. 
+USB is packet based (e.g. no DMA) and doesn't do PCI, as such, the usb data shouldn't be considered trusted, especially if it comes from a radio. 
+	
+obsd\sys\dev\usb\If_atu.c 
+/*
+ * A frame has been uploaded: pass the resulting mbuf chain up to
+ * the higher level protocols.
+ */
+void
+atu_rxeof(struct usbd_xfer *xfer, void *priv, usbd_status status)
+{
+...
+	h = (struct atu_rx_hdr *)c->atu_buf;
+	len = UGETW(h->length) - 4; /* XXX magic number */  <-- integer underflow 
+
+	m = c->atu_mbuf;
+	memcpy(mtod(m, char *), c->atu_buf + ATU_RX_HDRLEN, len); <-- need to validate len before copy. can cause memory corruption 
+...
+	usbd_setup_xfer(c->atu_xfer, sc->atu_ep[ATU_ENDPT_RX], c, c->atu_buf,
+	    ATU_RX_BUFSZ, USBD_SHORT_XFER_OK | USBD_NO_COPY, USBD_NO_TIMEOUT,
+		atu_rxeof);
+	usbd_transfer(c->atu_xfer);
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+Memory corruption in otus_sub_rxeof()
+
+otus_rxeof() is a usb read completion callback, and is called whenever data is received from usb. At most 8k can be
+read from usb. the data is then looped over and passed on to otus_sub_rxeof(). The length passed along to otus_sub_rxeof() can 
+be up to 8k. otus_sub_rxeof() allocates an mbuf to hold this data. If the length is larger than MHLEN an mbuf cluster is allocated. 
+There is NO check to see if the length is larger than MCLBYTES! After succesful mbuf, allocated the length is used to memcpy() data 
+into the mbuf. Given that there is no upperbound length check, memory corruption can occur. 
+
+With this attack surface, the idea is that a remote attacker has exploited some bug in the radio, and has code execution on the radio. 
+USB is packet based (e.g. no DMA) and doesn't do PCI, as such, the usb data shouldn't be considered trusted, especially if it comes from a radio. 
+
+
+obsd\sys\dev\usb\If_otus.c 
+void
+otus_sub_rxeof(struct otus_softc *sc, uint8_t *buf, int len) <-- len comes from usb. can be ~8k 
+{
+...
+	uint8_t *plcp;
+...
+	plcp = buf;
+...
+	mlen = len - AR_PLCP_HDR_LEN - sizeof (*tail);
+...
+	mlen -= IEEE80211_CRC_LEN;	/* strip 802.11 FCS */
+
+	wh = (struct ieee80211_frame *)(plcp + AR_PLCP_HDR_LEN);
+...
+	MGETHDR(m, M_DONTWAIT, MT_DATA);
+	if (__predict_false(m == NULL)) {
+		ifp->if_ierrors++;
+		return;
+	}
+	if (align + mlen > MHLEN) {
+		MCLGET(m, M_DONTWAIT); <-- allocates a cluster, which is 2048 bytes long
+		if (__predict_false(!(m->m_flags & M_EXT))) {
+			ifp->if_ierrors++;
+			m_freem(m);
+			return;
+		}
+	}
+	/* Finalize mbuf. */
+	m->m_data += align;
+	memcpy(mtod(m, caddr_t), wh, mlen); <-- mlen can be ~8k. can cause memory corruption.
+...
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+integer overflow in rsu_event_survey() can cause memory corruption. 
+
+rsu_rx_event() is called when a usb packet is read that contains a survey event. it contains a structures that has a 32bit length field (bss->ieslen). 
+There are several boundchecks to make sure this 32bit length field isn't too large to read out of bound or cause mbuf memory overflow. 
+These boundschecks suffer from integer overflow. If the 32bit length field is sufficiently large both boundschecks will be bypassed. 
+an mbuf will be allocated, and the 32bit length field will be used to memcpy() into the mbuf, causing memory corruption. 
+
+With this attack surface, the idea is that a remote attacker has exploited some bug in the radio, and has code execution on the radio. 
+USB is packet based (e.g. no DMA) and doesn't do PCI, as such, the usb data shouldn't be considered trusted, especially if it comes from a radio. 
+
+obsd\sys\dev\usb\If_rsu.c 
+void
+rsu_event_survey(struct rsu_softc *sc, uint8_t *buf, int len)
+{
+...
+	struct ndis_wlan_bssid_ex *bss;
+	struct mbuf *m;
+	int pktlen;
+...
+	bss = (struct ndis_wlan_bssid_ex *)buf;
+...
+	if (__predict_false(len < sizeof(*bss) + letoh32(bss->ieslen)))  <-- could int overflow 
+		return;
+...
+	/* Build a fake beacon frame to let net80211 do all the parsing. */
+	pktlen = sizeof(*wh) + letoh32(bss->ieslen); <-- could int overflow 
+	if (__predict_false(pktlen > MCLBYTES)) <-- signedness issue 
+		return;
+	MGETHDR(m, M_DONTWAIT, MT_DATA);
+	if (__predict_false(m == NULL))
+		return;
+	if (pktlen > MHLEN) {
+		MCLGET(m, M_DONTWAIT);
+		if (!(m->m_flags & M_EXT)) {
+			m_free(m);
+			return;
+		}
+	}
+	wh = mtod(m, struct ieee80211_frame *);
+...
+	memcpy(&wh[1], (uint8_t *)&bss[1], letoh32(bss->ieslen)); <-- memory corruption 
+...
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+Potential memory corruption in uath_data_rxeof()
+
+uath_data_rxeof() is an usb read completion callback. it can at most read sc->rxbufsz bytes (uath_query_eeprom() guarantees that 
+sc->rxbufsz is at most 0xfff [4095]). uath_data_rxeof() handles the current mbuf (hands it off to ieee80211_input()) but also sets 
+up the mbuf for the next read. It allocates an mbuf and mbuf cluster, and upon success passes it on to usbd_setup_xfer()/usbd_transfer() 
+to read from usb. Given that the usb can send up to 4095 (0xfff) bytes and that an mbuf cluster can contain up to ~2048 bytes of data 
+there can be memory corruption. 
+
+With this attack surface, the idea is that a remote attacker has exploited some bug in the radio, and has code execution on the radio. 
+USB is packet based (e.g. no DMA) and doesn't do PCI, as such, the usb data shouldn't be considered trusted, especially if it comes from a radio. 
+
+obsd\sys\dev\usb\If_uath.c 
+int
+uath_query_eeprom(struct uath_softc *sc)
+{
+	uint32_t tmp;
+	int error;
+
+	/* retrieve MAC address */
+	error = uath_read_eeprom(sc, UATH_EEPROM_MACADDR, sc->sc_ic.ic_myaddr);
+	if (error != 0) {
+		printf("%s: could not read MAC address\n",
+		    sc->sc_dev.dv_xname);
+		return error;
+	}
+
+	/* retrieve the maximum frame size that the hardware can receive */
+	error = uath_read_eeprom(sc, UATH_EEPROM_RXBUFSZ, &tmp);
+	if (error != 0) {
+		printf("%s: could not read maximum Rx buffer size\n",
+		    sc->sc_dev.dv_xname);
+		return error;
+	}
+	sc->rxbufsz = betoh32(tmp) & 0xfff; <-- length can be up to 4095. even though the mbuf cluster will only be 2048 bytes long 
+	DPRINTF(("maximum Rx buffer size %d\n", sc->rxbufsz));
+	return 0;
+}
+
+
+void
+uath_data_rxeof(struct usbd_xfer *xfer, void *priv,
+    usbd_status status)
+{
+...
+	usbd_get_xfer_status(xfer, NULL, NULL, &len, NULL);
+	hdr = betoh32(*(uint32_t *)data->buf);
+...
+	/* Rx descriptor is located at the end, 32-bit aligned */
+	desc = (struct uath_rx_desc *)
+	    (data->buf + len - sizeof (struct uath_rx_desc));
+
+	if (betoh32(desc->len) > sc->rxbufsz) {
+		DPRINTF(("bad descriptor (len=%d)\n", betoh32(desc->len)));
+		ifp->if_ierrors++;
+		goto skip;
+	}
+
+	/* there's probably a "bad CRC" flag somewhere in the descriptor.. */
+
+	MGETHDR(mnew, M_DONTWAIT, MT_DATA);
+	if (mnew == NULL) {
+		printf("%s: could not allocate rx mbuf\n",
+		    sc->sc_dev.dv_xname);
+		ifp->if_ierrors++;
+		goto skip;
+	}
+	MCLGET(mnew, M_DONTWAIT); <-- creates mbuf cluster 
+	if (!(mnew->m_flags & M_EXT)) {
+		printf("%s: could not allocate rx mbuf cluster\n",
+		    sc->sc_dev.dv_xname);
+		m_freem(mnew);
+		ifp->if_ierrors++;
+		goto skip;
+	}
+
+	m = data->m;
+	data->m = mnew;
+...
+	data->buf = mtod(data->m, uint8_t *); <-- points data->buf to mbuf cluster 
+...
+	usbd_setup_xfer(xfer, sc->data_rx_pipe, data, data->buf, sc->rxbufsz,
+	    USBD_SHORT_XFER_OK, USBD_NO_TIMEOUT, uath_data_rxeof); <-- can cause memory corruption if sc->rxbufsz is larger can 2048
+	(void)usbd_transfer(data->xfer);
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+pfioctl() assumes 0-terminated strings when handling data thats copied from userland, can cause out of bound reads. 
+
+pfioctl handles 3 cases (DIOCXBEGIN, DIOCXROLLBACK, DIOCXCOMMIT) that copy a pfioc_trans_e struct from userland to kernel. this structure contains a character array (anchor). 
+after the copy anchor is passed along to one of pf_begin_rules/pf_rollback_rules/pf_find_ruleset/pf_commit_rules. All of those functions assume a 0-terminated string. Since 
+it's really just a blob of bytes that came from userland, there is no guarantee there is a 0-byte in there. This can cause out of bound reads. 
+
+obsd\sys\net\Pf_ioctl.c 
+int
+pfioctl(dev_t dev, u_long cmd, caddr_t addr, int flags, struct proc *p)
+{
+	int			 s;
+	int			 error = 0;
+...
+	switch (cmd) {
+...
+	case DIOCXBEGIN: {
+		struct pfioc_trans	*io = (struct pfioc_trans *)addr;
+		struct pfioc_trans_e	*ioe;
+...
+		ioe = malloc(sizeof(*ioe), M_TEMP, M_WAITOK);
+...
+		for (i = 0; i < io->size; i++) {
+			if (copyin(io->array+i, ioe, sizeof(*ioe))) { <-- ioe content comes from userland 
+...
+			}
+			switch (ioe->type) {
+...
+			default:
+				if ((error = pf_begin_rules(&ioe->ticket,
+				    ioe->anchor))) { <-- ioe->anchor is not guaranteed to be a 0-terminated string. can read out of bound while parsing the string
+...
+				}
+				break;
+			}
+...
+		break;
+	}
+
+	case DIOCXROLLBACK: {
+		struct pfioc_trans	*io = (struct pfioc_trans *)addr;
+		struct pfioc_trans_e	*ioe;
+...
+		ioe = malloc(sizeof(*ioe), M_TEMP, M_WAITOK);
+...
+		for (i = 0; i < io->size; i++) {
+			if (copyin(io->array+i, ioe, sizeof(*ioe))) { <-- ioe content comes from userland
+...
+			switch (ioe->type) {
+...
+			default:
+				if ((error = pf_rollback_rules(ioe->ticket,
+				    ioe->anchor))) { <-- ioe->anchor is not guaranteed to be a 0-terminated string. can read out of bound while parsing the string
+...
+				}
+				break;
+			}
+		}
+...
+	}
+...
+	case DIOCXCOMMIT: {
+		struct pfioc_trans	*io = (struct pfioc_trans *)addr;
+		struct pfioc_trans_e	*ioe;
+...
+		ioe = malloc(sizeof(*ioe), M_TEMP, M_WAITOK);
+...
+		for (i = 0; i < io->size; i++) {
+			if (copyin(io->array+i, ioe, sizeof(*ioe))) { <-- ioe content comes from userland 
+...
+			}
+			switch (ioe->type) {
+			case PF_TRANS_TABLE:
+				rs = pf_find_ruleset(ioe->anchor); <-- ioe->anchor is not guaranteed to be a 0-terminated string. can read out of bound while parsing the string
+...
+				break;
+			default:
+				rs = pf_find_ruleset(ioe->anchor); <-- ioe->anchor is not guaranteed to be a 0-terminated string. can read out of bound while parsing the string
+...
+				break;
+			}
+		}
+...
+		for (i = 0; i < io->size; i++) {
+			if (copyin(io->array+i, ioe, sizeof(*ioe))) { <-- ioe content comes from userland 
+...
+			}
+			switch (ioe->type) {
+...
+			default:
+				if ((error = pf_commit_rules(ioe->ticket,
+				    ioe->anchor))) { <-- ioe->anchor is not guaranteed to be a 0-terminated string. can read out of bound while parsing the string
+...
+				}
+				break;
+			}
+		}
+...
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+integer overflow in wsdisplay_cfg_ioctl()
+
+wsdisplay_cfg_ioctl() handles the WSDISPLAYIO_LDFONT case. As part of that case it handles a wsdisplay_font struct. This structure contains several 32bit ints that get boundschecked. 
+They are used in a calculation for a total fontsize, and this fontsize is then boundschecked. The fontsize calculation contains an integer overflow. If triggered it can hit out of bound 
+issues later on. 
+
+obsd\sys\dev\wscons\Wsdisplay.c 
+int
+wsdisplay_cfg_ioctl(struct wsdisplay_softc *sc, u_long cmd, caddr_t data,
+    int flag, struct proc *p)
+{
+	int error;
+	void *buf;
+	size_t fontsz;
+#if NWSKBD > 0
+	struct wsevsrc *inp;
+#endif
+
+	switch (cmd) {
+...
+	case WSDISPLAYIO_LDFONT:
+#define d ((struct wsdisplay_font *)data)
+		if (!sc->sc_accessops->load_font)
+			return (EINVAL);
+		fontsz = d->fontheight * d->stride * d->numchars; <-- can int overflow. if triggered, will lead to out of bound accesses later on.
+		if (fontsz > WSDISPLAY_MAXFONTSZ)
+			return (EINVAL);
+
+		buf = malloc(fontsz, M_DEVBUF, M_WAITOK);
+		error = copyin(d->data, buf, fontsz);
+		if (error) {
+			free(buf, M_DEVBUF, fontsz);
+			return (error);
+		}
+		d->data = buf;
+		error =
+		  (*sc->sc_accessops->load_font)(sc->sc_accesscookie, 0, d);
+		if (error)
+			free(buf, M_DEVBUF, fontsz);
+		return (error);
+...
+	}
+	return (EINVAL);
+}
+
+
+

@@ -1,0 +1,1699 @@
+info leak in filemon driver 
+
+the filemon log wrappers for the link and rename syscall contain potential information leak issues due to misuse of snprintf(). 
+snprintf() is used to copy source and destination path names into a buffer. truncation can occur in case the combined lengths of src 
+and dst path names is longer than the destination buffer. in which case snprintf() will return the length copied _HAD THERE BEEN NO BOUNDS CHECK_. 
+that length is then used to write the buffer to a file. If truncation occurs the diff between len and end of buffer will be uninit data
+that will be copied to a file. 
+
+static void
+_filemon_wrapper_link(struct thread *td, char *upath1, char *upath2)
+{
+	struct filemon *filemon;
+	size_t len;
+	int error;
+
+	if ((filemon = filemon_proc_get(curproc)) != NULL) {
+		if (((error = copyinstr(upath1, filemon->fname1,
+		     sizeof(filemon->fname1), NULL)) != 0) ||
+		    ((error = copyinstr(upath2, filemon->fname2,
+		     sizeof(filemon->fname2), NULL)) != 0)) {
+			filemon->error = error;
+			goto copyfail;
+		}
+
+		len = snprintf(filemon->msgbufr,
+		    sizeof(filemon->msgbufr), "L %d '%s' '%s'\n",
+		    curproc->p_pid, filemon->fname1, filemon->fname2); <-- return value is how many bytes printed had there been no bounds check
+
+		filemon_output(filemon, filemon->msgbufr, len); <-- len can be bigger than msgbufr, leading to infoleak and/or panic
+copyfail:
+		filemon_drop(filemon);
+	}
+}
+
+same for filemon_wrapper_rename()
+
+-----------------------------------------
+
+the ksyms device stores a pointer to the process vm_pmap in fd/fp device specific data. it is used in the d_mmap callback for ksyms. 
+if the file descriptor is passed to a different process (e.g. send fd over a socket or through fork/execve) and the original process dies, 
+then the process that now has the fd has an expired pmap pointer. when that process tries to mmap the fd, it will reference the expired 
+pmap pointer. can cause panic or possibly elevation of privilege. [see attached poc and kernel dump output]
+
+freebsd-master\sys\dev\ksyms\ksyms.c	
+
+/* ARGSUSED */
+static int
+ksyms_open(struct cdev *dev, int flags, int fmt __unused, struct thread *td)
+{
+	struct tsizes ts;
+	size_t total_elf_sz;
+	int error, try;
+	struct ksyms_softc *sc;
+	
+	/* 
+	 *  Limit one open() per process. The process must close()
+	 *  before open()'ing again.
+	 */ 
+	mtx_lock(&ksyms_mtx);
+	LIST_FOREACH(sc, &ksyms_list, sc_list) {
+		if (sc->sc_proc == td->td_proc) {
+			mtx_unlock(&ksyms_mtx);
+			return (EBUSY);
+		}
+	}
+
+	sc = (struct ksyms_softc *) malloc(sizeof (*sc), M_KSYMS, 
+	    M_NOWAIT|M_ZERO);
+
+	if (sc == NULL) {
+		mtx_unlock(&ksyms_mtx);
+		return (ENOMEM);
+	}
+	sc->sc_proc = td->td_proc;
+	sc->sc_pmap = &td->td_proc->p_vmspace->vm_pmap; <-- will be used in d_mmap callback. 
+...
+}
+
+
+static int
+ksyms_mmap(struct cdev *dev, vm_ooffset_t offset, vm_paddr_t *paddr,
+		int prot __unused, vm_memattr_t *memattr __unused)
+{
+    	struct ksyms_softc *sc;
+	int error;
+
+	error = devfs_get_cdevpriv((void **)&sc);
+	if (error)
+		return (error);
+
+	/*
+	 * XXX mmap() will actually map the symbol table into the process
+	 * address space again.
+	 */
+	if (offset > round_page(sc->sc_usize) || 
+	    (*paddr = pmap_extract(sc->sc_pmap, 
+	    (vm_offset_t)sc->sc_uaddr + offset)) == 0) <-- if fd is send to this process, and original process died sc_pmap would no longer be valid!
+		return (-1);
+
+	return (0);
+}
+
+-----------------------------------------
+
+several race conditions in nandsim
+
+the nandsim driver has a global variable called crtls. when it's used no locks are held. this can cause race conditions in several places leading -among other things- to: 
+	- double free 
+	- NULL deref 
+	- memory leak 
+
+freebsd-master\sys\dev\nand\nandsim.c
+static int
+nandsim_create_chip(struct sim_chip *chip)
+{
+	struct sim_chip *sim_chip;
+
+	nand_debug(NDBG_SIM,"create chip num:%d at ctrl:%d", chip->num,
+	    chip->ctrl_num);
+
+	if (chip->ctrl_num >= MAX_SIM_DEV ||
+	    chip->num >= MAX_CTRL_CS) {
+		return (EINVAL);
+	}
+
+	if (ctrls[chip->ctrl_num].chips[chip->num]) {
+		return (EEXIST);
+	}
+
+	sim_chip = malloc(sizeof(*sim_chip), M_NANDSIM,
+	    M_WAITOK);
+	if (sim_chip == NULL) {
+		return (ENOMEM);
+	}
+
+	memcpy(sim_chip, chip, sizeof(*sim_chip));
+	ctrls[chip->ctrl_num].chips[chip->num] = sim_chip; <-- <-- no ctrls lock held, this can leak 
+	sim_chip->created = 1;
+
+	return (0);
+}
+
+
+static int
+nandsim_destroy_chip(struct sim_ctrl_chip *chip)
+{
+	struct sim_ctrl_conf *ctrl_conf;
+
+	nand_debug(NDBG_SIM,"destroy chip num:%d at ctrl:%d", chip->chip_num,
+	    chip->ctrl_num);
+
+	if (chip->ctrl_num >= MAX_SIM_DEV ||
+	    chip->chip_num >= MAX_CTRL_CS)
+		return (EINVAL);
+
+	ctrl_conf = &ctrls[chip->ctrl_num];
+
+	if (!ctrl_conf->created || !ctrl_conf->chips[chip->chip_num])
+		return (ENODEV);
+
+	if (ctrl_conf->running)
+		return (EBUSY);
+
+	free(ctrl_conf->chips[chip->chip_num], M_NANDSIM); <-- no ctrls lock held, this could double free
+	ctrl_conf->chips[chip->chip_num] = NULL;
+
+	return (0);
+}
+
+
+static int
+nandsim_modify(struct sim_mod *mod)
+{
+	struct sim_chip *sim_conf = NULL;
+	struct nandsim_chip *sim_chip = NULL;
+
+	nand_debug(NDBG_SIM,"modify ctlr %d chip %d", mod->ctrl_num,
+	    mod->chip_num);
+
+	if (mod->field != SIM_MOD_LOG_LEVEL) {
+		if (mod->ctrl_num >= MAX_SIM_DEV ||
+		    mod->chip_num >= MAX_CTRL_CS)
+			return (EINVAL);
+
+		sim_conf = ctrls[mod->ctrl_num].chips[mod->chip_num]; <-- can be NULL!
+		sim_chip = get_nandsim_chip(mod->ctrl_num, mod->chip_num); <-- can be NULL!
+	}
+
+	switch (mod->field) {
+	case SIM_MOD_LOG_LEVEL:
+		nandsim_log_level = mod->new_value; <-- NULL deref
+		break;
+	case SIM_MOD_ERASE_TIME:
+		sim_conf->erase_time = sim_chip->erase_delay = mod->new_value; <-- NULL deref
+		break;
+	case SIM_MOD_PROG_TIME:
+		sim_conf->prog_time = sim_chip->prog_delay = mod->new_value; <-- NULL deref
+		break;
+	case SIM_MOD_READ_TIME:
+		sim_conf->read_time = sim_chip->read_delay = mod->new_value; <-- NULL deref
+		break;
+	case SIM_MOD_ERROR_RATIO:
+		sim_conf->error_ratio = mod->new_value; <-- NULL deref
+		sim_chip->error_ratio = mod->new_value;
+		break;
+	default:
+		break;
+	}
+
+	return (0);
+}
+
+---------------------------------------------------------------
+
+out of bound read in zfsdev_ioctl() 
+
+zfsdev_ioctl() takes a cmd index from userland and uses it to index into an array. the index can be 0-255. The array being indexed into has less than 255 elements. 
+this can cause an out of bound read. 
+
+freebsd-master\sys\cddl\contrib\opensolaris\uts\common\fs\zfs\zfs_ioctl.c	
+static int
+zfsdev_ioctl(struct cdev *dev, u_long zcmd, caddr_t arg, int flag,
+    struct thread *td)
+{
+	zfs_cmd_t *zc;
+	uint_t vecnum;
+	int error, rc, len;
+...
+	len = IOCPARM_LEN(zcmd);
+	vecnum = cmd = zcmd & 0xff;
+...
+	if (len != sizeof(zfs_iocparm_t)) {
+		newioc = B_FALSE;
+		compat = B_TRUE;
+
+		vecnum = cmd;
+
+		switch (len) {
+...
+		case sizeof(zfs_cmd_v15_t):
+			cflag = ZFS_CMD_COMPAT_V15;
+			vecnum = zfs_ioctl_v15_to_v28[cmd]; <-- can read out of bound. array doesn't contain 255 elements
+
+			/*
+			 * Return without further handling
+			 * if the command is blacklisted.
+			 */
+			if (vecnum == ZFS_IOC_COMPAT_PASS)
+				return (0);
+			else if (vecnum == ZFS_IOC_COMPAT_FAIL)
+				return (ENOTSUP);
+			break;
+		default:
+			return (EINVAL);
+		}
+	}
+...
+}
+
+-----------------------------------------
+info leak in freebsd32_ioctl_args
+
+freebsd32_ioctl_args copies data into a local structure on the stack and then copies it to userland. it uses strlcpy() to copy 2 strings to the local structure on the stack. 
+strlcpy() will not zero-fill the entire buffer (unlike strncpy) and as such all the data in the character array buffer (inside the struct) beyond the terminating 0-byte will 
+contain uninitialized stack memory, and be copied out to userland. 
+
+freebsd-master\sys\compat\freebsd32\freebsd32_ioctl.c	
+static int
+freebsd32_ioctl_pciocgetconf(struct thread *td,
+    struct freebsd32_ioctl_args *uap, struct file *fp)
+{
+	struct pci_conf_io pci;
+	struct pci_conf_io32 pci32;
+	struct pci_match_conf32 pmc32;
+	struct pci_match_conf32 *pmc32p;
+	struct pci_match_conf pmc; <-- uninit
+	struct pci_match_conf *pmcp;
+	struct pci_conf32 pc32; <-- uninit
+	struct pci_conf32 *pc32p;
+...
+		CP(pmc32,pmc,pc_sel);
+		strlcpy(pmc.pd_name, pmc32.pd_name, sizeof(pmc.pd_name)); <-- leaves part of the struct (after 0-byte) uninit
+		CP(pmc32,pmc,pd_unit);
+		CP(pmc32,pmc,pc_vendor);
+		CP(pmc32,pmc,pc_device);
+		CP(pmc32,pmc,pc_class);
+		CP(pmc32,pmc,flags);
+		if ((error = copyout(&pmc, pmcp, sizeof(pmc))) != 0)
+			goto cleanup;
+...
+		CP(pc,pc32,pc_sel);
+		CP(pc,pc32,pc_hdr);
+		CP(pc,pc32,pc_subvendor);
+		CP(pc,pc32,pc_subdevice);
+		CP(pc,pc32,pc_vendor);
+		CP(pc,pc32,pc_device);
+		CP(pc,pc32,pc_class);
+		CP(pc,pc32,pc_subclass);
+		CP(pc,pc32,pc_progif);
+		CP(pc,pc32,pc_revid);
+		strlcpy(pc32.pd_name, pc.pd_name, sizeof(pc32.pd_name)); <-- leaves part of the struct (after 0-byte) uninit
+		CP(pc,pc32,pd_unit);
+		if ((error = copyout(&pc32, pc32p, sizeof(pc32))) != 0)
+			goto cleanup;
+...
+	return (error);
+}
+
+-----------------------------------------
+
+info leak in drm_infobufs()
+
+drm_infobufs() has a structure on the stack, fills it out and copies it to userland. There are 2 elements in the struct that are not filled out and left uninitialized. 
+This will leak uninitialized kernel stack data to userland. 
+
+
+freebsd-master\sys\dev\drm\drm.h	
+struct drm_buf_desc {
+	int count;		 /**< Number of buffers of this size */
+	int size;		 /**< Size in bytes */
+	int low_mark;		 /**< Low water mark */
+	int high_mark;		 /**< High water mark */
+	enum {
+		_DRM_PAGE_ALIGN = 0x01,	/**< Align on page boundaries for DMA */
+		_DRM_AGP_BUFFER = 0x02,	/**< Buffer is in AGP space */
+		_DRM_SG_BUFFER  = 0x04,	/**< Scatter/gather memory buffer */
+		_DRM_FB_BUFFER  = 0x08, /**< Buffer is in frame buffer */
+		_DRM_PCI_BUFFER_RO = 0x10 /**< Map PCI DMA buffer read-only */
+	} flags; <-- not filled in, will info leak
+	unsigned long agp_start; /**<     <-- not filled in, will info leak  
+				  * Start address of where the AGP buffers are
+				  * in the AGP aperture
+				  */
+};
+
+
+freebsd-master\sys\dev\drm\drm_bufs.c	
+int drm_infobufs(struct drm_device *dev, void *data, struct drm_file *file_priv)
+{
+	drm_device_dma_t *dma = dev->dma;
+	struct drm_buf_info *request = data;
+	int i;
+	int count;
+	int retcode = 0;
+
+	DRM_SPINLOCK(&dev->dma_lock);
+	++dev->buf_use;		/* Can't allocate more after this call */
+	DRM_SPINUNLOCK(&dev->dma_lock);
+
+	for (i = 0, count = 0; i < DRM_MAX_ORDER + 1; i++) {
+		if (dma->bufs[i].buf_count)
+			++count;
+	}
+
+	DRM_DEBUG("count = %d\n", count);
+
+	if (request->count >= count) {
+		for (i = 0, count = 0; i < DRM_MAX_ORDER + 1; i++) {
+			if (dma->bufs[i].buf_count) {
+				struct drm_buf_desc from; <-- should memset struct or fill in 2 missing elements 
+
+				from.count = dma->bufs[i].buf_count;
+				from.size = dma->bufs[i].buf_size;
+				from.low_mark = dma->bufs[i].freelist.low_mark;
+				from.high_mark = dma->bufs[i].freelist.high_mark;
+
+				if (DRM_COPY_TO_USER(&request->list[count], &from,  <-- infoleak 
+				    sizeof(struct drm_buf_desc)) != 0) {
+					retcode = EFAULT;
+					break;
+...
+
+------------------------------------------------------------------
+signedness bug in drm_modeset_ctl
+
+drm_modeset_ctl() takes a signed in from userland, does a boundscheck, and then uses it to index into a structure and write to it. 
+The boundscheck only checks upper bound, and never checks for nagative values. if the int coming from userland is negative it will 
+bypass the boundscheck, perform a negative index into an array and write to it, causing memory corruption. 
+
+
+freebsd-master\sys\dev\drm\drm_irq.c
+
+int drm_modeset_ctl(struct drm_device *dev, void *data,
+		    struct drm_file *file_priv)
+{
+	struct drm_modeset_ctl *modeset = data;
+	int crtc, ret = 0;
+
+	/* If drm_vblank_init() hasn't been called yet, just no-op */
+	if (!dev->num_crtcs)
+		goto out;
+
+	crtc = modeset->crtc;
+	if (crtc >= dev->num_crtcs) { <-- signed comparison! crtc can be negative 
+		ret = EINVAL;
+		goto out;
+	}
+...
+	switch (modeset->cmd) {
+	case _DRM_PRE_MODESET:
+		DRM_DEBUG("pre-modeset, crtc %d\n", crtc);
+		DRM_SPINLOCK(&dev->vbl_lock);
+		if (!dev->vblank[crtc].inmodeset) {
+			dev->vblank[crtc].inmodeset = 0x1; <-- memory corruption if crtc is negative! 
+			if (drm_vblank_get(dev, crtc) == 0)
+				dev->vblank[crtc].inmodeset |= 0x2;  <-- memory corruption if crtc is negative! 
+		}
+		DRM_SPINUNLOCK(&dev->vbl_lock);
+		break;
+...
+
+------------------------------------------------------------------
+integer overflow in cxgb_extension_ioctl() can cause infoleak / out of bound read / panic 
+
+cxgb_extension_ioctl() takes a struct from userland that contains a length and offset. A for loop is used to read some eeprom data from hardware and eventually copy it to userland. 
+if the (userland provided) length and offset overflow to something really small the loop will never be entered. 
+a copy from kernel memory to userland will still be performed using the offset and length provided by userland, which can cause an out of bound read, kernel panic and/or info leak. 
+
+freebsd-master\sys\dev\cxgb\cxgb_main.c	
+static int
+cxgb_extension_ioctl(struct cdev *dev, unsigned long cmd, caddr_t data,
+    int fflag, struct thread *td)
+{
+	int mmd, error = 0;
+...
+	switch (cmd) {
+...
+	case CHELSIO_GET_EEPROM: {
+		int i;
+		struct ch_eeprom *e = (struct ch_eeprom *)data;
+		uint8_t *buf = malloc(EEPROMSIZE, M_DEVBUF, M_NOWAIT);
+
+		if (buf == NULL) {
+			return (ENOMEM);
+		}
+		e->magic = EEPROM_MAGIC;
+		for (i = e->offset & ~3; !error && i < e->offset + e->len; i += 4) <-- offset + len could int overflow, in which case loop is never entered 
+			error = -t3_seeprom_read(sc, i, (uint32_t *)&buf[i]);
+
+		if (!error)
+			error = copyout(buf + e->offset, e->data, e->len); <-- out of bound read, can lead to panic or info leak
+
+		free(buf, M_DEVBUF);
+		break;
+	}
+...
+
+------------------------------------------------------------------
+info leak in svr4_sys_getdents64
+
+svr4_sys_getdents64() copies a dirent structure to userland. When calculating the record length for any given dirent entry alignment is performed. However, the aligned bytes are not cleared, 
+this will trigger an info leak. 
+
+freebsd-master\sys\compat\svr4\svr4_misc.c
+/*
+ * Read SVR4-style directory entries.  We suck them into kernel space so
+ * that they can be massaged before being copied out to user code.  
+ *
+ * This code is ported from the Linux emulator:  Changes to the VFS interface
+ * between FreeBSD and NetBSD have made it simpler to port it from there than
+ * to adapt the NetBSD version.
+ */
+int
+svr4_sys_getdents64(td, uap)
+	struct thread *td;
+	struct svr4_sys_getdents64_args *uap;
+{
+...
+	struct svr4_dirent64 svr4_dirent; 
+...
+		svr4reclen = SVR4_RECLEN(&svr4_dirent, bdp->d_namlen); <-- sets record len, but does alignment! (could be a few spare bytes at the end)
+...
+		strlcpy(svr4_dirent.d_name, bdp->d_name, sizeof(svr4_dirent.d_name)); <-- 0-terminates, but doesn't 0-set what's after that (strncpy() would do that), aligned bytes are uninitialized
+		if ((error = copyout((caddr_t)&svr4_dirent, outp, svr4reclen)))
+			goto out;
+...
+}
+
+------------------------------------------------------------------
+off-by-one buffer overflow in fuse_internal_readdir_processdata
+
+fuse_internal_readdir_processdata() allocates a structure where a 0-terminated string will be copied into. When doing the allocation it doesn't account for the extra 1 byte needed to 0-terminate the string. 
+When the string gets 0-terminated it will trigger an off-by-one buffer overflow. 
+
+freebsd\sys\fs\fuse\Fuse_internal.c 
+int
+fuse_internal_readdir_processdata(struct uio *uio,
+    size_t reqsize,
+    void *buf,
+    size_t bufsize,
+    void *param)
+{
+...
+		fudge = (struct fuse_dirent *)buf;
+...
+		bytesavail = GENERIC_DIRSIZ((struct pseudo_dirent *)
+					    &fudge->namelen);
+...
+		fiov_adjust(cookediov, bytesavail); <-- allocates bytesavail buffer 
+...
+		((char *)cookediov->base)[bytesavail] = '\0'; <-- write to buffer[bytesavail]. off-by-one heap overflow 
+...
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+info leak in ibcs2_getdents
+
+ibcs2_getdents() copies a dirent structure to userland. The ibcs2 dirent structure contains a 2 byte pad element. This element is never initialized, but copied to userland none-the-less. 
+this will trigger an info leak. 
+
+freebsd\sys\i386\ibcs2\Ibcs2_misc.c 
+int
+ibcs2_getdents(td, uap)
+	struct thread *td;
+	register struct ibcs2_getdents_args *uap;
+{
+...
+	struct ibcs2_dirent idb; <-- uninitialized
+...
+		/*
+		 * Massage in place to make an iBCS2-shaped dirent (otherwise
+		 * we have to worry about touching user memory outside of
+		 * the copyout() call).
+		 */
+		idb.d_ino = (ibcs2_ino_t)BSD_DIRENT(inp)->d_fileno;
+		idb.d_off = (ibcs2_off_t)off;
+		idb.d_reclen = (u_short)IBCS2_RECLEN(reclen);  <-- idb.d_pad never set. leaks 2 bytes of stack data to user 
+		if ((error = copyout((caddr_t)&idb, outp, 10)) != 0 ||
+		    (error = copyout(BSD_DIRENT(inp)->d_name, outp + 10,
+				     BSD_DIRENT(inp)->d_namlen + 1)) != 0)
+...
+}
+
+freebsd\sys\i386\ibcs2\Ibcs2_misc.c 
+struct ibcs2_dirent {
+	ibcs2_ino_t	d_ino;
+	short		d_pad;  <-- never initialized 
+	ibcs2_off_t	d_off;
+	u_short		d_reclen;
+	char		d_name[1];
+};
+
+---------------------------------------------------------------------------------------------------------------------------
+panic ext2_nodealloccg() driven by filesystem data 
+
+ext2_nodealloccg() does a bread() (reads from the filesystem, could be a mounted malicious fs image) and calls panic based on 
+data that is read from the filesystem. 
+
+freebsd\sys\fs\ext2fs\Ext2_alloc.c 
+static daddr_t
+ext2_nodealloccg(struct inode *ip, int cg, daddr_t ipref, int mode)
+{
+...
+	error = bread(ip->i_devvp, fsbtodb(fs,
+	    fs->e2fs_gd[cg].ext2bgd_i_bitmap),
+	    (int)fs->e2fs_bsize, NOCRED, &bp);
+...
+	ibp = (char *)bp->b_data;
+...
+	len = howmany(fs->e2fs->e2fs_ipg - ipref, NBBY);
+	loc = memcchr(&ibp[start], 0xff, len);
+	if (loc == NULL) {
+		len = start + 1;
+		start = 0;
+		loc = memcchr(&ibp[start], 0xff, len); <-- logic driven by fs data 
+		if (loc == NULL) {
+			printf("cg = %d, ipref = %lld, fs = %s\n",
+			    cg, (long long)ipref, fs->e2fs_fsmnt);
+			panic("ext2fs_nodealloccg: map corrupted");  <-- panic driven by fs data
+			/* NOTREACHED */
+		}
+	}
+...
+}
+
+
+---------------------------------------------------------------------------------------------------------------------------
+sendfile infoleak. 
+
+the sendfile syscall contains an infoleak when copying the number of bytes send to userland. Specifically, when sendfile is performed on a file descriptor that doesn't support sendfile (e.g. some /dev device). When copying the number of bytes back to userland there is no check to see if the actual sendfile operation succeeded. if it failed an uninitialized sbytes off_t is copied to userland. 
+
+The same issue is also in the freebsd32 compat version of sendfile. 
+
+freebsd\sys\kern\Kern_sendfile.c 
+static int
+sendfile(struct thread *td, struct sendfile_args *uap, int compat)
+{
+	struct sf_hdtr hdtr;
+	struct uio *hdr_uio, *trl_uio;
+	struct file *fp;
+	cap_rights_t rights;
+	off_t sbytes;
+	int error;
+...
+	error = fo_sendfile(fp, uap->s, hdr_uio, trl_uio, uap->offset,
+	    uap->nbytes, &sbytes, uap->flags, td); <-- if error occurs, there is no guarantee sbytes is initialized 
+	fdrop(fp, td);
+
+	if (uap->sbytes != NULL)
+		copyout(&sbytes, uap->sbytes, sizeof(off_t)); <-- can leak uninit stack data if fo_sendfile() failed. 
+
+out:
+	free(hdr_uio, M_IOV);
+	free(trl_uio, M_IOV);
+	return (error);
+}
+
+
+
+freebsd\sys\compat\freebsd32\Freebsd32_misc.c 
+static int
+freebsd32_do_sendfile(struct thread *td,
+    struct freebsd32_sendfile_args *uap, int compat)
+{
+...
+	off_t offset, sbytes;
+...
+	error = fo_sendfile(fp, uap->s, hdr_uio, trl_uio, offset,
+	    uap->nbytes, &sbytes, uap->flags, td); <-- if error occurs, there is no guarantee sbytes is initialized 
+	fdrop(fp, td);
+
+	if (uap->sbytes != NULL) <-- no check if error is 0 
+		copyout(&sbytes, uap->sbytes, sizeof(off_t)); <-- can leak uninit stack data if fo_sendfile() failed. 
+...
+}
+
+looks like this was introduced in 2013  (as of FreeBSD 9.3)
+
+Revision 258613 - (view) (download) (annotate) - [select for diffs] 
+Modified Tue Nov 26 02:02:05 2013 UTC (3 years, 5 months ago) by adrian 
+Original Path: head/sys/kern/uipc_syscalls.c 
+File length: 68095 byte(s) 
+Diff to previous 256847
+Refactor out the sendfile copyout in order to make vn_sendfile()
+callable from the kernel.
+
+Right now vn_sendfile() can't be called from anything other than
+a syscall handler _and_ return the number of bytes queued.
+This simply moves the copyout() to do_sendfile() so that any kernel
+code can initiate vn_sendfile() outside of a syscall context.
+
+Tested:
+
+* tiny little sendfile program spitting things out a tcp socket
+
+Sponsored by:	Netflix, Inc.
+
+
+I have an exploit for this issue.
+
+
+---------------------------------------------------------------------------------------------------------------------------
+infoleak in kldstat 
+
+the kldstat() syscall is used to query information about loaded drivers. among others, it tells userland the name of the driver, and the file path. Both as part of a struct. Both elements are char arrays of MAXPATH length. When those structures are filled out, the string length is used to copy them into the structure, which leaves the bytes after the 0-byte uninitialized. Once copied to userland this leaks about ~2000 bytes of uninit stack data. 
+
+the same issue is also in the freebsd32 compat code for kldstat.
+
+freebsd\sys\kern\Kern_linker.c 
+int
+sys_kldstat(struct thread *td, struct kldstat_args *uap)
+{
+	struct kld_file_stat stat;
+	int error, version;
+
+	/*
+	 * Check the version of the user's structure.
+	 */
+	if ((error = copyin(&uap->stat->version, &version, sizeof(version)))
+	    != 0)
+		return (error);
+	if (version != sizeof(struct kld_file_stat_1) &&
+	    version != sizeof(struct kld_file_stat))
+		return (EINVAL);
+
+	error = kern_kldstat(td, uap->fileid, &stat); <-- will copy a string into stat's name and pathname character array. leaving all the data after the 0-byte uninitialized 
+	if (error != 0)
+		return (error);
+	return (copyout(&stat, uap->stat, version)); <-- infoleaks uninit data to userland
+} 
+
+
+
+freebsd\sys\compat\freebsd32\Freebsd32_misc.c 
+int
+freebsd32_kldstat(struct thread *td, struct freebsd32_kldstat_args *uap)
+{
+	struct kld_file_stat stat; <-- not metset'ed 
+	struct kld32_file_stat stat32;
+	int error, version;
+
+	if ((error = copyin(&uap->stat->version, &version, sizeof(version)))
+	    != 0)
+		return (error);
+	if (version != sizeof(struct kld32_file_stat_1) &&
+	    version != sizeof(struct kld32_file_stat))
+		return (EINVAL);
+
+	error = kern_kldstat(td, uap->fileid, &stat); <-- will copy a string into stat's name and pathname character array. leaving all the data after the 0-byte uninitialized 
+	if (error != 0)
+		return (error);
+
+	bcopy(&stat.name[0], &stat32.name[0], sizeof(stat.name)); <-- copied uninit data from stat to stat32
+	CP(stat, stat32, refs);
+	CP(stat, stat32, id);
+	PTROUT_CP(stat, stat32, address);
+	CP(stat, stat32, size);
+	bcopy(&stat.pathname[0], &stat32.pathname[0], sizeof(stat.pathname));  <-- copied uninit data from stat to stat32
+	return (copyout(&stat32, uap->stat, version)); <-- infoleaks uninit data to userland
+}
+
+bug has been there almost 10 years (FreeBSD 7)
+
+https://svnweb.freebsd.org/base/stable/11/sys/kern/kern_linker.c?view=log&log_pagestart=0
+Revision 172862 - (view) (download) (annotate) - [select for diffs] 
+Modified Mon Oct 22 04:12:57 2007 UTC (9 years, 7 months ago) by jb 
+Original Path: head/sys/kern/kern_linker.c 
+File length: 48871 byte(s) 
+Diff to previous 170152
+Add the full module path name to the kld_file_stat structure
+for kldstat(2).
+
+This allows libdtrace to determine the exact file from which
+a kernel module was loaded without having to guess.
+
+The kldstat(2) API is versioned with the size of the
+kld_file_stat structure, so this change creates version 2.
+
+Add the pathname to the verbose output of kldstat(8) too.
+
+MFC: 3 days
+
+I have an exploit for this issue.
+
+---------------------------------------------------------------------------------------------------------------------------
+integer overflow in g_dev_ioctl() 
+
+g_dev_ioctl() is the geom device ioctl handler. one of the ioctls it handles is DIOCZONECMD. it takes a number of entries element as input, and uses it to calculate a size. the calculation can trigger an integer overflow (on 32bit). Additionally, when the size is passed to g_malloc() an integer truncation issue can occur (on 64bit). The int overflow and truncation can lead to either an infoleak or memory corruption. 
+
+freebsd\sys\geom\Geom_dev.c 
+static int
+g_dev_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag, struct thread *td)
+{
+	struct g_consumer *cp;
+	struct g_provider *pp;
+	off_t offset, length, chunk, odd;
+	int i, error;
+...
+	switch (cmd) {
+...
+	case DIOCZONECMD: {
+		struct disk_zone_args *zone_args =(struct disk_zone_args *)data;
+		struct disk_zone_rep_entry *new_entries, *old_entries;
+		struct disk_zone_report *rep;
+		size_t alloc_size;
+
+		old_entries = NULL;
+		new_entries = NULL;
+		rep = NULL;
+		alloc_size = 0;
+
+		if (zone_args->zone_cmd == DISK_ZONE_REPORT_ZONES) {
+
+			rep = &zone_args->zone_params.report;
+			alloc_size = rep->entries_allocated *
+			    sizeof(struct disk_zone_rep_entry); <-- can int overflow (on 32 bit)
+			if (alloc_size != 0)
+				new_entries = g_malloc(alloc_size,  <-- g_malloc() takes int as length input. can truncate (on 64 bit) 
+				    M_WAITOK| M_ZERO);
+			old_entries = rep->entries;
+			rep->entries = new_entries;
+		}
+		error = g_io_zonecmd(zone_args, cp); <-- memory corruption 
+		if ((zone_args->zone_cmd == DISK_ZONE_REPORT_ZONES)
+		 && (alloc_size != 0)
+		 && (error == 0)) {
+			error = copyout(new_entries, old_entries, alloc_size); <-- possible infoleak in case of int truncation 
+		}
+		if ((old_entries != NULL)
+		 && (rep != NULL))
+			rep->entries = old_entries;
+
+		if (new_entries != NULL)
+			g_free(new_entries);
+		break;
+	}
+...
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+infoleak in hpt_ioctl()
+
+the hpt_ioctl() ioctl handler contains an information leak when copying data to userland. It allocates a buffer (without M_ZERO)
+then calls hpt_do_ioctl() and then copies that buffer to userland. 
+
+
+freebsd\sys\dev\hpt27xx\Hpt27xx_osm_bsd.c 
+static int hpt_ioctl(struct cdev *dev, u_long cmd, caddr_t data, int fflag, struct thread *td)
+{
+	PHPT_IOCTL_PARAM piop=(PHPT_IOCTL_PARAM)data;
+...
+		ioctl_args.nOutBufferSize = piop->nOutBufferSize;
+...
+			ioctl_args.lpOutBuffer = malloc(ioctl_args.nOutBufferSize, M_DEVBUF, M_WAITOK);  <-- no M_ZERO 
+...
+		hpt_do_ioctl(&ioctl_args);
+...
+			if (piop->nOutBufferSize) {
+				if (copyout(ioctl_args.lpOutBuffer,
+					(void*)piop->lpOutBuffer, piop->nOutBufferSize))  <-- info leak. piop->nOutBufferSize can be larger then whats copied into ioctl_args.lpOutBuffer
+...
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+info leak in ia32_osendsig()
+
+ia32_osendsig() fills out a ia32_sigframe3 structure and copies it to userland. The struct is not memset'ed and several elements 
+are not filled in, leading to an infoleak. 
+
+freebsd\sys\amd64\ia32\Ia32_signal.c 
+ia32_osendsig(sig_t catcher, ksiginfo_t *ksi, sigset_t *mask)
+{
+	struct ia32_sigframe3 sf, *fp; <-- sf is uninitialized. should memset/bzero before use 
+	struct proc *p;
+	struct thread *td;
+	struct sigacts *psp;
+	struct trapframe *regs;
+	int sig;
+	int oonstack;
+...
+	if (SIGISMEMBER(psp->ps_siginfo, sig)) {  <-- sf.sf_addr not set here 
+		/* Signal handler installed with SA_SIGINFO. */
+		sf.sf_arg2 = (register_t)&fp->sf_siginfo;
+		sf.sf_siginfo.si_signo = sig;
+		sf.sf_siginfo.si_code = ksi->ksi_code;
+		sf.sf_ah = (uintptr_t)catcher;
+	} else { <-- sf.sf_siginfo.si_signo and sf.sf_siginfo.si_code not set here 
+		/* Old FreeBSD-style arguments. */
+		sf.sf_arg2 = ksi->ksi_code;
+		sf.sf_addr = (register_t)ksi->ksi_addr;
+		sf.sf_ah = (uintptr_t)catcher;
+	}
+...
+	if (copyout(&sf, fp, sizeof(*fp)) != 0) { <-- info leak here because sf not memset'ed and some elements are not initialized. 
+...
+	}
+...
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+infoleak in ath_btcoex_ioctl
+
+ath_btcoex_ioctl() allocates a buffer, and simply copies it to userland without initializing or doing anything with the buffer. 
+
+freebsd\sys\dev\ath\If_ath_btcoex.c 
+ath_btcoex_ioctl(struct ath_softc *sc, struct ath_diag *ad)
+{
+	unsigned int id = ad->ad_id & ATH_DIAG_ID;
+	void *indata = NULL;
+	void *outdata = NULL;
+	u_int32_t insize = ad->ad_in_size;
+	u_int32_t outsize = ad->ad_out_size;
+...
+	if (ad->ad_id & ATH_DIAG_DYN) {
+...
+		outdata = malloc(outsize, M_TEMP, M_NOWAIT); <-- should use M_ZERO. This buffer is _NEVER_ filled in and straight copied to userland! 
+		if (outdata == NULL) {
+...
+		}
+	}
+...
+	if (outdata && copyout(outdata, ad->ad_out_data, ad->ad_out_size))
+		error = EFAULT;
+...
+	return (error);
+}
+
+same bug in ath_lna_div_ioctl
+looks like ath_ioctl_spectral might have the same bug. 
+
+---------------------------------------------------------------------------------------------------------------------------
+infoleak in linux_ioctl_socket()
+
+linux_ioctl_socket() supports a number of IOCTLs that copies an ifname to userland. the ifname is strlcpy'ed into a local 
+stackbuffer (of size IFNAMSIZ) and then copied to userland. The strlcpy() leaves the data beyond the 0-byte uninitialized, 
+leading to an infoleak. 
+
+freebsd\sys\compat\linux\Linux_ioctl.c 
+static int
+linux_ioctl_socket(struct thread *td, struct linux_ioctl_args *args)
+{
+	char lifname[LINUX_IFNAMSIZ], ifname[IFNAMSIZ];
+	cap_rights_t rights;
+	struct ifnet *ifp;
+	struct file *fp;
+	int error, type;
+...
+	switch (args->cmd & 0xffff) {
+...
+	case LINUX_SIOCGIFFLAGS:
+	case LINUX_SIOCGIFADDR:
+	case LINUX_SIOCSIFADDR:
+	case LINUX_SIOCGIFDSTADDR:
+	case LINUX_SIOCGIFBRDADDR:
+	case LINUX_SIOCGIFNETMASK:
+	case LINUX_SIOCSIFNETMASK:
+	case LINUX_SIOCGIFMTU:
+	case LINUX_SIOCSIFMTU:
+	case LINUX_SIOCSIFNAME:
+	case LINUX_SIOCGIFHWADDR:
+	case LINUX_SIOCSIFHWADDR:
+	case LINUX_SIOCDEVPRIVATE:
+	case LINUX_SIOCDEVPRIVATE+1:
+	case LINUX_SIOCGIFINDEX:
+		/* copy in the interface name and translate it. */
+		error = copyin((void *)args->arg, lifname, LINUX_IFNAMSIZ);
+		if (error != 0)
+			return (error);
+#ifdef DEBUG
+		printf("%s(): ioctl %d on %.*s\n", __func__,
+		    args->cmd & 0xffff, LINUX_IFNAMSIZ, lifname);
+#endif
+		ifp = ifname_linux_to_bsd(td, lifname, ifname);  <-- does a strlcpy() into ifname and leaves the rest of ifname uninitialized 
+		if (ifp == NULL)
+			return (EINVAL);
+		/*
+		 * We need to copy it back out in case we pass the
+		 * request on to our native ioctl(), which will expect
+		 * the ifreq to be in user space and have the correct
+		 * interface name.
+		 */
+		error = copyout(ifname, (void *)args->arg, IFNAMSIZ); <-- infoleak 
+		if (error != 0)
+			return (error);
+...
+}
+
+
+static struct ifnet *
+ifname_linux_to_bsd(struct thread *td, const char *lxname, char *bsdname)
+{
+	struct ifnet *ifp;
+	int len, unit;
+	char *ep;
+	int is_eth, index;
+...
+	if (ifp != NULL)
+		strlcpy(bsdname, ifp->if_xname, IFNAMSIZ); <-- strlcpy() leaves data after 0-byte uninitialized 
+	return (ifp);
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+infoleak in linux_msgctl()
+
+linux_msgctl() handles a number of cases. one case in specific, LINUX_IPC_STAT, fills in a l_msqid64_ds struct and then copies it to userland. 
+The structure contains several elements (__unused1 ... __unused5) that are never initialized. This causes an infoleak of uninitialized stack data
+to userland. 
+
+freebsd\sys\compat\linux\Linux_ipc.c 
+int
+linux_msgctl(struct thread *td, struct linux_msgctl_args *args)
+{
+	int error, bsd_cmd;
+	struct l_msqid64_ds linux_msqid64;  <-- uninitialized 
+...
+	bsd_cmd = args->cmd & ~LINUX_IPC_64;
+	switch (bsd_cmd) {
+...
+	case LINUX_IPC_STAT:
+		/* NOTHING */
+		break;
+...
+	}
+...
+	if (bsd_cmd == LINUX_IPC_STAT) {
+		bsd_to_linux_msqid_ds(&bsd_msqid, &linux_msqid64); <-- doesn't entirely initialize linux_msqid64
+		return (linux_msqid_pushdown(args->cmd & LINUX_IPC_64,
+		    &linux_msqid64, PTRIN(args->buf)));  <-- does a copyout of linux_msqid64 to userland, infoleak. 
+	}
+
+	return (0);
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+infoleak in linux_semctl()
+
+linux_semctl() handles a number of cases. one case in specific, LINUX_IPC_STAT and LINUX_SEM_STAT, fills in a l_semid64_ds struct and then copies it to userland. 
+The structure contains several elements (__unused1 ... __unused4) that are never initialized. This causes an infoleak of uninitialized stack data to userland. 
+
+freebsd\sys\compat\linux\Linux_ipc.c 
+int
+linux_semctl(struct thread *td, struct linux_semctl_args *args)
+{
+	struct l_semid64_ds linux_semid64;  <-- uninitialized 
+	struct l_seminfo linux_seminfo;
+	struct semid_ds semid;
+	union semun semun;
+	register_t rval;
+	int cmd, error;
+
+	switch (args->cmd & ~LINUX_IPC_64) {
+...
+	case LINUX_IPC_STAT:
+		cmd = IPC_STAT;
+		semun.buf = &semid;
+		error = kern_semctl(td, args->semid, args->semnum, cmd, &semun,
+		    &rval);
+		if (error != 0)
+			return (error);
+		bsd_to_linux_semid_ds(&semid, &linux_semid64); <-- doesn't entirely initialize linux_semid64
+		return (linux_semid_pushdown(args->cmd & LINUX_IPC_64, 
+		    &linux_semid64, PTRIN(args->arg.buf))); <-- does a copyout of linux_semid64 to userland, infoleak.
+	case LINUX_SEM_STAT:
+		cmd = SEM_STAT;
+		semun.buf = &semid;
+		error = kern_semctl(td, args->semid, args->semnum, cmd, &semun,
+		    &rval);
+		if (error != 0)
+			return (error);
+		bsd_to_linux_semid_ds(&semid, &linux_semid64); <-- doesn't entirely initialize linux_semid64
+		error = linux_semid_pushdown(args->cmd & LINUX_IPC_64,
+		    &linux_semid64, PTRIN(args->arg.buf)); <-- does a copyout of linux_semid64 to userland, infoleak.
+		if (error == 0)
+			td->td_retval[0] = rval;
+		return (error);
+...
+	}
+...
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+infoleak in linux_shmctl()
+
+linux_shmctl() handles a number of cases. one case in specific, LINUX_IPC_STAT, LINUX_IPC_INFO and LINUX_SHM_STAT, fills in a l_shmid64_ds struct (or l_shminfo64 in the case of LINUX_IPC_INFO)
+and then copies it to userland. The structure contains several elements (__unused1 ... __unused5) that are never initialized. This causes an infoleak of uninitialized stack data to userland. 
+
+freebsd\sys\compat\linux\Linux_ipc.c 
+int
+linux_shmctl(struct thread *td, struct linux_shmctl_args *args)
+{
+	struct l_shmid64_ds linux_shmid64; <-- uninitialized 
+	struct l_shminfo64 linux_shminfo64; <-- uninitialized 
+	struct l_shm_info linux_shm_info;
+	struct shmid_ds bsd_shmid;
+	int error;
+
+	switch (args->cmd & ~LINUX_IPC_64) {
+
+	case LINUX_IPC_INFO: {
+		struct shminfo bsd_shminfo;
+
+		/* Perform shmctl wanting removed segments lookup */
+		error = kern_shmctl(td, args->shmid, IPC_INFO,
+		    (void *)&bsd_shminfo, NULL);
+		if (error != 0)
+			return (error);
+
+		bsd_to_linux_shminfo(&bsd_shminfo, &linux_shminfo64); <-- doesn't entirely initialize linux_shminfo64
+
+		return (linux_shminfo_pushdown(args->cmd & LINUX_IPC_64,
+		    &linux_shminfo64, PTRIN(args->buf))); <-- does a copyout of linux_shminfo64 to userland, infoleak.
+	}
+...
+	case LINUX_IPC_STAT:
+		/* Perform shmctl wanting removed segments lookup */
+		error = kern_shmctl(td, args->shmid, IPC_STAT,
+		    (void *)&bsd_shmid, NULL);
+		if (error != 0)
+			return (error);
+
+		bsd_to_linux_shmid_ds(&bsd_shmid, &linux_shmid64); <-- doesn't entirely initialize linux_shmid64
+
+		return (linux_shmid_pushdown(args->cmd & LINUX_IPC_64,
+		    &linux_shmid64, PTRIN(args->buf))); <-- does a copyout of linux_shmid64 to userland, infoleak.
+
+	case LINUX_SHM_STAT:
+		/* Perform shmctl wanting removed segments lookup */
+		error = kern_shmctl(td, args->shmid, IPC_STAT,
+		    (void *)&bsd_shmid, NULL);
+		if (error != 0)
+			return (error);
+
+		bsd_to_linux_shmid_ds(&bsd_shmid, &linux_shmid64); <-- doesn't entirely initialize linux_shmid64
+
+		return (linux_shmid_pushdown(args->cmd & LINUX_IPC_64,
+		    &linux_shmid64, PTRIN(args->buf)));  <-- does a copyout of linux_shmid64 to userland, infoleak.
+...
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+integer overflow in nandfs_get_dat_bdescs_ioctl() can cause out of bound read and write
+
+nandfs_get_dat_bdescs_ioctl() is the ioctl handler for NANDFS_IOCTL_GET_BDESCS. it takes a nandfs_argv struct as input from userland. 
+one of its elements (nv_nmembs) is used in a buffer length calculation. The calculation contains an integer overflow. if triggered, it 
+can lead to out of bound reads and writes later on.  
+
+freebsd\sys\fs\nandfs\Nandfs_dat.c 
+int
+nandfs_get_dat_bdescs_ioctl(struct nandfs_device *nffsdev,
+    struct nandfs_argv *nargv) <-- nargv content comes from userland 
+{
+	struct nandfs_bdesc *bd;
+	size_t size;
+	int error;
+
+	size = nargv->nv_nmembs * sizeof(struct nandfs_bdesc); <-- integer overflow 
+	bd = malloc(size, M_NANDFSTEMP, M_WAITOK); <-- alloc too short in case of overflow 
+	error = copyin((void *)(uintptr_t)nargv->nv_base, bd, size);
+...
+	error = nandfs_get_dat_bdescs(nffsdev, bd, nargv->nv_nmembs); <-- can cause out of bound read and write
+...
+}
+
+int
+nandfs_get_dat_bdescs(struct nandfs_device *nffsdev, struct nandfs_bdesc *bd,
+    uint32_t nmembs)
+{
+	struct nandfs_node *dat_node;
+	uint64_t map;
+	uint32_t i;
+	int error = 0;
+
+	dat_node = nffsdev->nd_dat_node;
+
+	VOP_LOCK(NTOV(dat_node), LK_EXCLUSIVE);
+
+	for (i = 0; i < nmembs; i++) { <-- if int overflow is triggered, this can iterate off the end of bd 
+		DPRINTF(CLEAN,
+		    ("%s: bd ino:%#jx oblk:%#jx blocknr:%#jx off:%#jx\n",
+		    __func__,  (uintmax_t)bd[i].bd_ino,
+		    (uintmax_t)bd[i].bd_oblocknr, (uintmax_t)bd[i].bd_blocknr,
+		    (uintmax_t)bd[i].bd_offset));
+
+		error = nandfs_bmap_lookup(dat_node, bd[i].bd_offset, &map); <-- out of bound read if iterate off the end of bd
+		if (error)
+			break;
+		bd[i].bd_blocknr = map; <-- out of bound write if iterate off the end of bd
+	}
+
+	VOP_UNLOCK(NTOV(dat_node), 0);
+	return (error);
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+integer overflow in pfioctl() can cause out of bound read and write 
+
+pfioctl() handles several ioctl that takes variable length input, these include: 
+- DIOCRADDTABLES
+- DIOCRDELTABLES
+- DIOCRGETTABLES
+- DIOCRGETTSTATS
+- DIOCRCLRTSTATS
+- DIOCRSETTFLAGS
+
+all of them take a pfioc_table struct as input from userland. One of it's elements (pfrio_size) is used in a buffer length calculation. 
+The calculation contains an integer overflow. if triggered, it can lead to out of bound reads and writes later on.  
+
+freebsd\sys\netpfil\pf\Pf_ioctl.c 
+static int
+pfioctl(struct cdev *dev, u_long cmd, caddr_t addr, int flags, struct thread *td)
+{
+	int			 error = 0;
+...
+	switch (cmd) {
+...
+	case DIOCRADDTABLES: {
+		struct pfioc_table *io = (struct pfioc_table *)addr;
+		struct pfr_table *pfrts;
+		size_t totlen;
+
+		if (io->pfrio_esize != sizeof(struct pfr_table)) {
+			error = ENODEV;
+			break;
+		}
+		totlen = io->pfrio_size * sizeof(struct pfr_table); <-- integer overflow 
+		pfrts = malloc(totlen, M_TEMP, M_WAITOK); <-- alloc too short in case of integer overflow 
+		error = copyin(io->pfrio_buffer, pfrts, totlen);
+		if (error) {
+			free(pfrts, M_TEMP);
+			break;
+		}
+		PF_RULES_WLOCK();
+		error = pfr_add_tables(pfrts, io->pfrio_size,
+		    &io->pfrio_nadd, io->pfrio_flags | PFR_FLAG_USERIOCTL); <-- out of bound read/write due to int overflow 
+		PF_RULES_WUNLOCK();
+		free(pfrts, M_TEMP);
+		break;
+	}
+
+	case DIOCRDELTABLES: {
+		struct pfioc_table *io = (struct pfioc_table *)addr;
+		struct pfr_table *pfrts;
+		size_t totlen;
+
+		if (io->pfrio_esize != sizeof(struct pfr_table)) {
+			error = ENODEV;
+			break;
+		}
+		totlen = io->pfrio_size * sizeof(struct pfr_table); <-- integer overflow 
+		pfrts = malloc(totlen, M_TEMP, M_WAITOK); <-- alloc too short in case of integer overflow
+		error = copyin(io->pfrio_buffer, pfrts, totlen);
+		if (error) {
+			free(pfrts, M_TEMP);
+			break;
+		}
+		PF_RULES_WLOCK();
+		error = pfr_del_tables(pfrts, io->pfrio_size,
+		    &io->pfrio_ndel, io->pfrio_flags | PFR_FLAG_USERIOCTL); <-- out of bound read/write due to int overflow
+		PF_RULES_WUNLOCK();
+		free(pfrts, M_TEMP);
+		break;
+	}
+
+	case DIOCRGETTABLES: {
+		struct pfioc_table *io = (struct pfioc_table *)addr;
+		struct pfr_table *pfrts;
+		size_t totlen;
+
+		if (io->pfrio_esize != sizeof(struct pfr_table)) {
+			error = ENODEV;
+			break;
+		}
+		totlen = io->pfrio_size * sizeof(struct pfr_table); <-- integer overflow 
+		pfrts = malloc(totlen, M_TEMP, M_WAITOK); <-- alloc too short in case of integer overflow
+		PF_RULES_RLOCK();
+		error = pfr_get_tables(&io->pfrio_table, pfrts,
+		    &io->pfrio_size, io->pfrio_flags | PFR_FLAG_USERIOCTL); <-- out of bound read/write due to int overflow
+		PF_RULES_RUNLOCK();
+		if (error == 0)
+			error = copyout(pfrts, io->pfrio_buffer, totlen);
+		free(pfrts, M_TEMP);
+		break;
+	}
+
+	case DIOCRGETTSTATS: {
+		struct pfioc_table *io = (struct pfioc_table *)addr;
+		struct pfr_tstats *pfrtstats;
+		size_t totlen;
+
+		if (io->pfrio_esize != sizeof(struct pfr_tstats)) {
+			error = ENODEV;
+			break;
+		}
+		totlen = io->pfrio_size * sizeof(struct pfr_tstats); <-- integer overflow
+		pfrtstats = malloc(totlen, M_TEMP, M_WAITOK); <-- alloc too short in case of integer overflow
+		PF_RULES_WLOCK();
+		error = pfr_get_tstats(&io->pfrio_table, pfrtstats,
+		    &io->pfrio_size, io->pfrio_flags | PFR_FLAG_USERIOCTL); <-- out of bound read/write due to int overflow
+		PF_RULES_WUNLOCK();
+		if (error == 0)
+			error = copyout(pfrtstats, io->pfrio_buffer, totlen);
+		free(pfrtstats, M_TEMP);
+		break;
+	}
+
+	case DIOCRCLRTSTATS: {
+		struct pfioc_table *io = (struct pfioc_table *)addr;
+		struct pfr_table *pfrts;
+		size_t totlen;
+
+		if (io->pfrio_esize != sizeof(struct pfr_table)) {
+			error = ENODEV;
+			break;
+		}
+		totlen = io->pfrio_size * sizeof(struct pfr_table); <-- integer overflow
+		pfrts = malloc(totlen, M_TEMP, M_WAITOK); <-- alloc too short in case of integer overflow
+		error = copyin(io->pfrio_buffer, pfrts, totlen);
+		if (error) {
+			free(pfrts, M_TEMP);
+			break;
+		}
+		PF_RULES_WLOCK();
+		error = pfr_clr_tstats(pfrts, io->pfrio_size,
+		    &io->pfrio_nzero, io->pfrio_flags | PFR_FLAG_USERIOCTL); <-- out of bound read/write due to int overflow
+		PF_RULES_WUNLOCK();
+		free(pfrts, M_TEMP);
+		break;
+	}
+
+	case DIOCRSETTFLAGS: {
+		struct pfioc_table *io = (struct pfioc_table *)addr;
+		struct pfr_table *pfrts;
+		size_t totlen;
+
+		if (io->pfrio_esize != sizeof(struct pfr_table)) {
+			error = ENODEV;
+			break;
+		}
+		totlen = io->pfrio_size * sizeof(struct pfr_table); <-- integer overflow
+		pfrts = malloc(totlen, M_TEMP, M_WAITOK); <-- alloc too short in case of integer overflow
+		error = copyin(io->pfrio_buffer, pfrts, totlen);
+		if (error) {
+			free(pfrts, M_TEMP);
+			break;
+		}
+		PF_RULES_WLOCK();
+		error = pfr_set_tflags(pfrts, io->pfrio_size,
+		    io->pfrio_setflag, io->pfrio_clrflag, &io->pfrio_nchange,
+		    &io->pfrio_ndel, io->pfrio_flags | PFR_FLAG_USERIOCTL); <-- out of bound read/write due to int overflow
+		PF_RULES_WUNLOCK();
+		free(pfrts, M_TEMP);
+		break;
+	}
+...
+	}
+...
+	return (error);
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+infoleak in ptrace when handling PT_LWPINFO
+
+When ptrace is called for a PT_LWPINFO request, a ptrace_lwpinfo structure is filled out and copied to userland. the struct contains a 
+character array (pl_tdname[]) which gets data written to it using strcpy(). if the string getting copied to it is smaller than the entire 
+array, the rest of the bytes in the array (past the terminating 0-byte) remain uninitialized. cause an information leak. 
+
+freebsd\sys\sys\Ptrace.h 
+struct ptrace_lwpinfo {
+	lwpid_t	pl_lwpid;	/* LWP described. */
+	int	pl_event;	/* Event that stopped the LWP. */
+	int	pl_flags;	/* LWP flags. */
+	sigset_t	pl_sigmask;	/* LWP signal mask */
+	sigset_t	pl_siglist;	/* LWP pending signal */
+	struct __siginfo pl_siginfo;	/* siginfo for signal */
+	char		pl_tdname[MAXCOMLEN + 1]; /* LWP name */    <-- this struct doesn't get entirely initialized with ptrace(PT_LWPINFO)
+	pid_t		pl_child_pid;	/* New child pid */
+	u_int		pl_syscall_code;
+	u_int		pl_syscall_narg;
+};
+
+
+freebsd\sys\kern\Sys_process.c 
+sys_ptrace(struct thread *td, struct ptrace_args *uap)
+{
+	union {
+		struct ptrace_io_desc piod;
+		struct ptrace_lwpinfo pl;
+		struct ptrace_vm_entry pve;
+		struct dbreg dbreg;
+		struct fpreg fpreg;
+		struct reg reg;
+#ifdef COMPAT_FREEBSD32
+		struct dbreg32 dbreg32;
+		struct fpreg32 fpreg32;
+		struct reg32 reg32;
+		struct ptrace_io_desc32 piod32;
+		struct ptrace_lwpinfo32 pl32;
+		struct ptrace_vm_entry32 pve32;
+#endif
+		int ptevents;
+	} r;
+	void *addr;
+...
+	addr = &r;
+	switch (uap->req) {
+...
+	case PT_LWPINFO:
+		break;
+...
+	}
+...
+	error = kern_ptrace(td, uap->req, uap->pid, addr, uap->data);  <-- addr = &r. r.pl doesn't get entirely initialized with ptrace(PT_LWPINFO)
+...
+	switch (uap->req) {
+...
+	case PT_LWPINFO:
+		/* NB: The size in uap->data is validated in kern_ptrace(). */
+		error = copyout(&r.pl, uap->addr, uap->data); <-- info leak of r.pl.pl_tdname uninitialized data 
+		break;
+	}
+...
+	return (error);
+}
+
+int
+kern_ptrace(struct thread *td, int req, pid_t pid, void *addr, int data)
+{
+...
+	/*
+	 * Actually do the requests
+	 */
+...
+	switch (req) {
+...
+	case PT_LWPINFO:
+...
+		pl = addr;
+...
+		strcpy(pl->pl_tdname, td2->td_name); <-- leaves the rest of pl->pl_tdname (beyond the 0-byte) uninitialized  
+...
+		break;
+...
+	}
+...
+	return (error);
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+integer overflow in krb5_import when handling KGSS_HEIMDAL_1_1 messages 
+
+krb5_import() handles krb5 network data. it reads a 32bit element count (km_jitter_window) and uses it to calculate the length of a buffer.
+This calculation can contain an integer overflow. if the overflow is triggered a malloc() will occur with a buffer that is too small. 
+After the allocation a loop is used to fill the buffer, based on km_jitter_window. This loop will cause memory corruption if the integer overflow 
+is triggered. 
+
+freebsd\sys\kgssapi\krb5\Krb5_mech.c 
+static OM_uint32
+krb5_import(gss_ctx_id_t ctx,
+    enum sec_context_format format,
+    const gss_buffer_t context_token)
+{
+...
+	const uint8_t *p = (const uint8_t *) context_token->value;
+...
+		kc->kc_msg_order.km_jitter_window = get_uint32(&p, &len);
+...
+		kc->kc_msg_order.km_elem =
+			malloc(kc->kc_msg_order.km_jitter_window * sizeof(uint32_t),
+			    M_GSSAPI, M_WAITOK);  <-- integer overflow, alloc too small if triggered  
+		for (i = 0; i < kc->kc_msg_order.km_jitter_window; i++)
+			kc->kc_msg_order.km_elem[i] = get_uint32(&p, &len); <-- memory corruption
+...
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+memory leak in arge_encap()
+
+arge_encap() is handed a pointer to an mbuf pointer. it can call m_defrag() to defragment the mbuf if needed. If m_defrag() fails, 
+it sets the pointer to the mbuf pointer to NULL and returns. this leaks the mbuf! before returning and before setting the pointer to the mbuf 
+pointer to NULL, the mbuf should've been free'd. 
+
+freebsd\sys\mips\atheros\If_arge.c 
+static int
+arge_encap(struct arge_softc *sc, struct mbuf **m_head)
+{
+...
+		m = m_defrag(*m_head, M_NOWAIT); <-- if m_defrag() fails, it will not free *m_head
+		if (m == NULL) {
+			*m_head = NULL; <-- drops mbuf on the floor. want to mfreem(*m_head) before doing this. 
+			return (ENOBUFS);
+		}
+...
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+double free in bwn_tx_start/bwn_dma_tx_start in if_bwm
+
+bwn_tx_start is handed an mbuf to transmit. it passes it off to bwn_dma_tx_start() and then upon return free's the mbuf if failure occured. 
+There are some error corner cases where bwn_dma_tx_start() can fail with the mbuf already being free'd, which will lead to a double free. 
+
+freebsd\sys\dev\bwn\If_bwn.c 
+static int
+bwn_tx_start(struct bwn_softc *sc, struct ieee80211_node *ni, struct mbuf *m)
+{
+	struct bwn_mac *mac = sc->sc_curmac;
+	int error;
+
+	BWN_ASSERT_LOCKED(sc);
+
+	if (m->m_pkthdr.len < IEEE80211_MIN_LEN || mac == NULL) {
+		m_freem(m);
+		return (ENXIO);
+	}
+
+	error = (mac->mac_flags & BWN_MAC_FLAG_DMA) ?
+	    bwn_dma_tx_start(mac, ni, m) : bwn_pio_tx_start(mac, ni, m);  <-- can fail and have already free'd mbuf 
+	if (error) { <-- if an error is encountered, free the mbuf 
+		m_freem(m);
+		return (error);
+	}
+	return (0);
+}
+
+
+static int
+bwn_dma_tx_start(struct bwn_mac *mac, struct ieee80211_node *ni, struct mbuf *m)
+{
+...
+	error = bus_dmamap_load_mbuf(dma->txbuf_dtag, mt->mt_dmap, m,
+	    bwn_dma_buf_addr, &mt->mt_paddr, BUS_DMA_NOWAIT);
+	if (error && error != EFBIG) {
+		device_printf(sc->sc_dev, "%s: can't load TX buffer (1) %d\n",
+		    __func__, error);
+		goto fail;
+	}
+	if (error) {    /* error == EFBIG */
+		struct mbuf *m_new;
+
+		m_new = m_defrag(m, M_NOWAIT);
+...
+		struct mbuf *m_new;
+
+		m_new = m_defrag(m, M_NOWAIT); <-- if m_defrag() succeeds, it will free the mbuf its given as input
+...
+		error = bus_dmamap_load_mbuf(dma->txbuf_dtag, mt->mt_dmap,
+		    m, bwn_dma_buf_addr, &mt->mt_paddr, BUS_DMA_NOWAIT); <-- fail, but mbuf is free'd. caller will free it again 
+		if (error) {
+			device_printf(sc->sc_dev,
+			    "%s: can't load TX buffer (2) %d\n",
+			    __func__, error);
+			goto fail;
+		}
+...
+fail:
+	dr->dr_curslot = backup[0];
+	dr->dr_usedslot = backup[1];
+	return (error);
+#undef BWN_GET_TXHDRCACHE
+}
+
+
+---------------------------------------------------------------------------------------------------------------------------
+numerous NULL deref due to wrong use of M_NOWAIT. 
+
+when allocating memory on the BSDs, a flag can be passed to malloc. if the flag says M_NOWAIT, it means the allocator won't
+wait for memory to become available (if it isn't available right away) and will return NULL. This implies that the caller 
+_MUST_ check the return value for NULL. There are several instances where this isn't the case: 
+
+
+freebsd\sys\dev\ata\chipsets\Ata-promise.c 
+static void
+ata_promise_queue_hpkt(struct ata_pci_controller *ctlr, u_int32_t hpkt)
+{
+    struct ata_promise_sx4 *hpktp = ctlr->chipset_data;
+
+    mtx_lock(&hpktp->mtx);
+    if (hpktp->busy) {
+	struct host_packet *hp = 
+	    malloc(sizeof(struct host_packet), M_TEMP, M_NOWAIT | M_ZERO);   <-- need to check return value 
+	hp->addr = hpkt; <-- NULL deref 
+	TAILQ_INSERT_TAIL(&hpktp->queue, hp, chain);
+    }
+    else {
+	hpktp->busy = 1;
+	ATA_OUTL(ctlr->r_res2, 0x000c0100, hpkt);
+    }
+    mtx_unlock(&hpktp->mtx);
+}
+
+
+freebsd\sys\dev\drm2\radeon\Atom.c 
+static void atom_index_iio(struct atom_context *ctx, int base)
+{
+	ctx->iio = malloc(2 * 256, DRM_MEM_DRIVER, M_NOWAIT | M_ZERO); <-- need to check return value 
+	while (CU8(base) == ATOM_IIO_START) {
+		ctx->iio[CU8(base + 1)] = base + 2;
+		base += 2;
+		while (CU8(base) != ATOM_IIO_END)
+			base += atom_iio_len[CU8(base)];
+		base += 3;
+	}
+}
+
+
+freebsd\sys\dev\bhnd\nvram\Bhnd_nvram_private.h 
+/* We need our own strdup() implementation to pass required M_NOWAIT */
+static inline char *
+bhnd_nv_strdup(const char *str)
+{
+	char	*dest;
+	size_t	 len;
+
+	len = strlen(str);
+	dest = malloc(len + 1, M_BHND_NVRAM, M_NOWAIT); <-- need to check return value 
+	memcpy(dest, str, len);
+	dest[len] = '\0';
+
+	return (dest);
+}
+static inline char *
+bhnd_nv_strndup(const char *str, size_t len)
+{
+	char	*dest;
+
+	len = strnlen(str, len);
+	dest = malloc(len + 1, M_BHND_NVRAM, M_NOWAIT);  <-- need to check return value 
+	memcpy(dest, str, len);
+	dest[len] = '\0';
+
+	return (dest);
+}
+
+
+freebsd\sys\arm\samsung\exynos\Chrome_ec.c 
+int
+ec_command(uint8_t cmd, uint8_t *dout, uint8_t dout_len,
+    uint8_t *dinp, uint8_t dinp_len)
+{
+	struct ec_softc *sc;
+	uint8_t *msg_dout;
+	uint8_t *msg_dinp;
+	int ret;
+	int i;
+
+	msg_dout = malloc(dout_len + 4, M_DEVBUF, M_NOWAIT);  <-- need to check return value 
+	msg_dinp = malloc(dinp_len + 3, M_DEVBUF, M_NOWAIT);  <-- need to check return value 
+
+	if (ec_sc == NULL)
+		return (-1);
+
+	sc = ec_sc;
+
+	msg_dout[0] = EC_CMD_VERSION0;
+	msg_dout[1] = cmd;
+	msg_dout[2] = dout_len;
+...
+}
+same issue in freebsd\sys\arm\samsung\exynos\Chrome_ec_spi.c 
+
+
+freebsd\sys\arm\samsung\exynos\Chrome_kb.c 
+static int
+chrome_kb_attach(device_t dev)
+{
+...
+	sc->scan_local = malloc(sc->cols, M_DEVBUF, M_NOWAIT);  <-- need to check return value 
+	sc->scan = malloc(sc->cols, M_DEVBUF, M_NOWAIT);  <-- need to check return value 
+
+	for (i = 0; i < sc->cols; i++) {
+		sc->scan_local[i] = 0;
+		sc->scan[i] = 0;
+	}
+...
+}
+
+
+freebsd\sys\dev\cxgbe\iw_cxgbe\Cm.c 
+static int fw6_cqe_handler(struct adapter *sc, const __be64 *rpl)
+{
+	struct cqe_list_entry *cle;
+	unsigned long flag;
+
+	cle = malloc(sizeof(*cle), M_CXGBE, M_NOWAIT); <-- need to check return value 
+	cle->rhp = sc->iwarp_softc;
+	cle->err_cqe = *(const struct t4_cqe *)(&rpl[0]);
+
+	spin_lock_irqsave(&err_cqe_lock, flag);
+	list_add_tail(&cle->entry, &err_cqe_list);
+	queue_work(c4iw_taskq, &c4iw_task);
+	spin_unlock_irqrestore(&err_cqe_lock, flag);
+
+	return (0);
+}
+
+
+freebsd\sys\dev\cxgbe\cxgbei\Cxgbei.c 
+static int
+do_rx_iscsi_ddp(struct sge_iq *iq, const struct rss_header *rss, struct mbuf *m)
+{
+...
+			ip0 = icl_cxgbei_new_pdu(M_NOWAIT);
+			icl_cxgbei_new_pdu_set_conn(ip0, ic);
+			if (ip0 == NULL) <-- check too late 
+				CXGBE_UNIMPLEMENTED("PDU allocation failure");
+...
+}
+
+freebsd\sys\dev\drm\Drm_sysctl.c 
+
+....
+
+---------------------------------------------------------------------------------------------------------------------------
+information leak in tcp_ctloutput() 
+
+tcp_ctloutput() is called to handle setsockopt() and getsockopt() options for tcp sockets. It contains an information leak 
+when handling a TCP_FUNCTION_BLK getsockopt(). the structure returned contains a character array. When it's filled in (with strcpy())
+the data after the terminating 0-byte is never initialized. The structure is then copied to userland, and hence the uninitialized 
+bytes at the end of the character array leak uninitialized kernel stack data. 
+
+freebsd\sys\netinet\Tcp_usrreq.c 
+int
+tcp_ctloutput(struct socket *so, struct sockopt *sopt)
+{
+	int	error;
+	struct	inpcb *inp;
+	struct	tcpcb *tp;
+	struct tcp_function_block *blk;
+	struct tcp_function_set fsn;
+...
+	if ((sopt->sopt_dir == SOPT_SET) && 
+	    (sopt->sopt_name == TCP_FUNCTION_BLK)) {
+...
+	} else if ((sopt->sopt_dir == SOPT_GET) && 
+	    (sopt->sopt_name == TCP_FUNCTION_BLK)) {
+		strcpy(fsn.function_set_name, tp->t_fb->tfb_tcp_block_name); <-- doesn't initialize data after the 0-byte 
+		fsn.pcbcnt = tp->t_fb->tfb_refcnt;
+		INP_WUNLOCK(inp);
+		error = sooptcopyout(sopt, &fsn, sizeof fsn); <-- infoleak 
+		return (error);
+	}
+	/* Pass in the INP locked, called must unlock it */
+	return (tp->t_fb->tfb_tcp_ctloutput(so, sopt, inp, tp));
+}
+
+I have an exploit for this issue. 
+
+---------------------------------------------------------------------------------------------------------------------------
+
+

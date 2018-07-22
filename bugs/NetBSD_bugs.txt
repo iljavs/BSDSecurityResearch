@@ -1,0 +1,2324 @@
+infoleak in get_class_stats()
+
+jobscmd_class_stats() declares a structure on the stack (struct class_stats) populates it, and copies it to userland (copyout()). 
+The structure isn't entirely filled in (and never memset'ed) and hence uninitialized stack data can be copied to userland. 
+
+netbsd\src\sys\altq\Altq_jobs.c 
+static int
+jobscmd_class_stats(struct jobs_class_stats *ap)
+{
+        struct jobs_if *jif;
+        struct jobs_class *cl;
+        struct class_stats stats, *usp; <-- stats is uninitialized (should be init to 0)
+        int pri, error;
+
+        if ((jif = altq_lookup(ap->iface.jobs_ifname, ALTQT_JOBS)) == NULL)
+                return (EBADF);
+
+        ap->maxpri = jif->jif_maxpri;
+
+        /* then, read the next N classes */
+        usp = ap->stats;
+        for (pri = 0; pri <= jif->jif_maxpri; pri++) {
+                cl = jif->jif_classes[pri];
+                if (cl != NULL)
+                        get_class_stats(&stats, cl); <-- leaves 1 element of stats uninitialized 
+                else
+                        (void)memset(&stats, 0, sizeof(stats));
+                if ((error = copyout((void *)&stats, (void *)usp++,
+                                     sizeof(stats))) != 0) <-- copied out to userland 
+                        return (error);
+        }
+        return (0);
+}
+
+static void
+get_class_stats(struct class_stats *sp, struct jobs_class *cl) <-- does not initialize 'service_rate' element
+{
+        u_int64_t now;
+        now = read_machclk();
+
+        sp->class_handle = clp_to_clh(cl);
+        sp->qlength = qlen(cl->cl_q);
+
+        sp->period = cl->cl_period;
+        sp->rin = cl->st_rin;
+        sp->arrival = cl->st_arrival;
+        sp->arrivalbusy = cl->cl_arrival;
+        sp->rout = cl->st_rout;
+        sp->dropcnt = cl->cl_dropcnt;
+
+        /*  PKTCNTR_RESET(&cl->st_arrival);*/
+        PKTCNTR_RESET(&cl->st_rin);
+        PKTCNTR_RESET(&cl->st_rout);
+
+        sp->totallength = cl->cl_jif->jif_ifq->ifq_len;
+        sp->lastdel = ticks_to_secs(GRANULARITY*cl->cl_lastdel);
+        sp->avgdel = cl->cl_avgdel;
+
+        cl->cl_avgdel = 0;
+
+        sp->busylength = ticks_to_secs(1000*delay_diff(now, cl->idletime));
+        sp->adc_violations = cl->adc_violations;
+
+        sp->wc_cycles_enqueue = cl->cl_jif->wc_cycles_enqueue;
+        sp->wc_cycles_dequeue = cl->cl_jif->wc_cycles_dequeue;
+        sp->bc_cycles_enqueue = cl->cl_jif->bc_cycles_enqueue;
+        sp->bc_cycles_dequeue = cl->cl_jif->bc_cycles_dequeue;
+        sp->avg_cycles_enqueue = cl->cl_jif->avg_cycles_enqueue;
+        sp->avg_cycles_dequeue = cl->cl_jif->avg_cycles_dequeue;
+        sp->avg_cycles2_enqueue = cl->cl_jif->avg_cycles2_enqueue;
+        sp->avg_cycles2_dequeue = cl->cl_jif->avg_cycles2_dequeue;
+        sp->total_enqueued = cl->cl_jif->total_enqueued;
+        sp->total_dequeued = cl->cl_jif->total_dequeued;
+}
+
+
+netbsd\src\sys\altq\Altq_jobs.h 
+struct class_stats {
+        u_int   adc_violations;
+        u_int   totallength;
+        u_int    period;
+        u_int   qlength;
+
+        u_long  class_handle;
+
+        int64_t service_rate;           /* bps that should be out */  <-- element never initialized 
+
+        u_int64_t       avg_cycles_dequeue;
+        u_int64_t       avg_cycles_enqueue;
+        u_int64_t       avg_cycles2_dequeue;
+        u_int64_t       avg_cycles2_enqueue;
+        u_int64_t       avgdel;         /* in us */
+        u_int64_t       bc_cycles_dequeue;
+        u_int64_t       bc_cycles_enqueue;
+        u_int64_t       busylength;     /* in ms */
+        u_int64_t       lastdel;        /* in us */
+        u_int64_t       total_dequeued;
+        u_int64_t       total_enqueued;
+        u_int64_t       wc_cycles_dequeue;
+        u_int64_t       wc_cycles_enqueue;
+
+        struct  pktcntr arrival;        /* rin+dropped */
+        struct  pktcntr arrivalbusy;
+        struct  pktcntr rin;            /* dropped packet counter */
+        struct  pktcntr rout;           /* transmitted packet counter */
+        struct  pktcntr dropcnt;        /* dropped packet counter */
+};
+
+----------------------------------------------------------------------------------------------------------------------
+infoleak in get_class_stats()
+
+get_class_stats() declares a structure on the stack (class_stats_t) populates it, and copies it to userland (copyout()). 
+The structure isn't entirely filled in (and never memset'ed) and hence uninitialized stack data can be copied to userland. 
+
+netbsd\src\sys\altq\Altq_cbq.c 
+static int
+cbq_getstats(struct cbq_getstats *gsp)
+{
+        char            *ifacename;
+        int             i, n, nclasses;
+        cbq_state_t     *cbqp;
+        struct rm_class *cl;
+        class_stats_t   stats, *usp; <-- stats is uninitialized 
+        int error = 0;
+
+        ifacename = gsp->iface.cbq_ifacename;
+        nclasses = gsp->nclasses;
+        usp = gsp->stats;
+
+        if ((cbqp = altq_lookup(ifacename, ALTQT_CBQ)) == NULL)
+                return (EBADF);
+        if (nclasses <= 0)
+                return (EINVAL);
+
+        for (n = 0, i = 0; n < nclasses && i < CBQ_MAX_CLASSES; n++, i++) {
+                while ((cl = cbqp->cbq_class_tbl[i]) == NULL)
+                        if (++i >= CBQ_MAX_CLASSES)
+                                goto out;
+
+                get_class_stats(&stats, cl); <-- leaves some elements in tact
+                stats.handle = cl->stats_.handle;
+
+                if ((error = copyout((void *)&stats, (void *)usp++, <-- copies to userland 
+                    sizeof(stats))) != 0)
+                        return (error);
+        }
+
+ out:
+        gsp->nclasses = n;
+        return (error);
+}
+
+
+static void
+get_class_stats(class_stats_t *statsp, struct rm_class *cl) <-- leaves some elements uninitialized 
+{
+        statsp->xmit_cnt        = cl->stats_.xmit_cnt;
+        statsp->drop_cnt        = cl->stats_.drop_cnt;
+        statsp->over            = cl->stats_.over;
+        statsp->borrows         = cl->stats_.borrows;
+        statsp->overactions     = cl->stats_.overactions;
+        statsp->delays          = cl->stats_.delays;
+
+        statsp->depth           = cl->depth_;
+        statsp->priority        = cl->pri_;
+        statsp->maxidle         = cl->maxidle_;
+        statsp->minidle         = cl->minidle_;
+        statsp->offtime         = cl->offtime_;
+        statsp->qmax            = qlimit(cl->q_);
+        statsp->ns_per_byte     = cl->ns_per_byte_;
+        statsp->wrr_allot       = cl->w_allotment_;
+        statsp->qcnt            = qlen(cl->q_);
+        statsp->avgidle         = cl->avgidle_;
+
+        statsp->qtype           = qtype(cl->q_);
+#ifdef ALTQ_RED
+        if (q_is_red(cl->q_))
+                red_getstats(cl->red_, &statsp->red[0]);
+#endif
+#ifdef ALTQ_RIO
+        if (q_is_rio(cl->q_))
+                rio_getstats((rio_t *)cl->red_, &statsp->red[0]);
+#endif
+}
+
+
+netbsd\src\sys\altq\Altq_cbq.h 
+
+typedef struct _cbq_class_stats_ {
+        u_int32_t       handle; <-- not initialized 
+        u_int           depth;
+
+        struct pktcntr  xmit_cnt;       /* packets sent in this class */
+        struct pktcntr  drop_cnt;       /* dropped packets */
+        u_int           over;           /* # times went over limit */
+        u_int           borrows;        /* # times tried to borrow */
+        u_int           overactions;    /* # times invoked overlimit action */
+        u_int           delays;         /* # times invoked delay actions */
+
+        /* other static class parameters useful for debugging */
+        int             priority;
+        int             maxidle;
+        int             minidle;
+        int             offtime;
+        int             qmax;
+        int             ns_per_byte;
+        int             wrr_allot;
+
+        int             qcnt;           /* # packets in queue */
+        int             avgidle;
+
+        /* red and rio related info */
+        int             qtype;
+        struct redstats red[3]; <-- possibly not entirely initialized 
+} class_stats_t;
+
+----------------------------------------------------------------------------------------------------------------------------------
+infoleak in get_class_stats()
+
+hfsccmd_class_stats() declares a structure on the stack (struct hfsc_classstats) populates it, and copies it to userland (copyout()). 
+The structure isn't entirely filled in (and never memset'ed) and hence uninitialized stack data can be copied to userland. 
+
+netbsd\src\sys\altq\Altq_hfsc.c 
+static int
+hfsccmd_class_stats(struct hfsc_class_stats *ap)
+{
+        struct hfsc_if *hif;
+        struct hfsc_class *cl;
+        struct hfsc_classstats stats, *usp; <-- stats not initialized 
+        int     n, nclasses, error;
+
+        if ((hif = altq_lookup(ap->iface.hfsc_ifname, ALTQT_HFSC)) == NULL)
+                return (EBADF);
+
+        ap->cur_time = read_machclk();
+        ap->machclk_freq = machclk_freq;
+        ap->hif_classes = hif->hif_classes;
+        ap->hif_packets = hif->hif_packets;
+
+        /* skip the first N classes in the tree */
+        nclasses = ap->nskip;
+        for (cl = hif->hif_rootclass, n = 0; cl != NULL && n < nclasses;
+             cl = hfsc_nextclass(cl), n++)
+                ;
+        if (n != nclasses)
+                return (EINVAL);
+
+        /* then, read the next N classes in the tree */
+        nclasses = ap->nclasses;
+        usp = ap->stats;
+        for (n = 0; cl != NULL && n < nclasses; cl = hfsc_nextclass(cl), n++) {
+
+                get_class_stats(&stats, cl); <-- stats not guaranteed to be entirely initialized 
+
+                if ((error = copyout((void *)&stats, (void *)usp++,
+                                     sizeof(stats))) != 0) <-- copied to userland 
+                        return (error);
+        }
+
+        ap->nclasses = n;
+
+        return (0);
+}
+
+static void
+get_class_stats(struct hfsc_classstats *sp, struct hfsc_class *cl)
+{
+...
+#ifdef ALTQ_RED
+        if (q_is_red(cl->cl_q)) <-- not guaranteed to be initialized
+                red_getstats(cl->cl_red, &sp->red[0]); <-- only initialized first element. red has 3 elements 
+#endif
+#ifdef ALTQ_RIO
+        if (q_is_rio(cl->cl_q)) <-- not guaranteed to be initialized  
+                rio_getstats((rio_t *)cl->cl_red, &sp->red[0]);
+#endif
+}
+
+netbsd\src\sys\altq\Altq_hfsc.h 
+struct hfsc_classstats {
+        u_int                   class_id;
+        u_int32_t               class_handle;
+        struct service_curve    rsc;
+        struct service_curve    fsc;
+        struct service_curve    usc;    /* upper limit service curve */
+
+        u_int64_t               total;  /* total work in bytes */
+        u_int64_t               cumul;  /* cumulative work in bytes
+                                           done by real-time criteria */
+        u_int64_t               d;              /* deadline */
+        u_int64_t               e;              /* eligible time */
+        u_int64_t               vt;             /* virtual time */
+        u_int64_t               f;              /* fit time for upper-limit */
+
+        /* info helpful for debugging */
+        u_int64_t               initvt;         /* init virtual time */
+        u_int64_t               vtoff;          /* cl_vt_ipoff */
+        u_int64_t               cvtmax;         /* cl_maxvt */
+        u_int64_t               myf;            /* cl_myf */
+        u_int64_t               cfmin;          /* cl_mincf */
+        u_int64_t               cvtmin;         /* cl_mincvt */
+        u_int64_t               myfadj;         /* cl_myfadj */
+        u_int64_t               vtadj;          /* cl_vtadj */
+        u_int64_t               cur_time;
+        u_int32_t               machclk_freq;
+
+        u_int                   qlength;
+        u_int                   qlimit;
+        struct pktcntr          xmit_cnt;
+        struct pktcntr          drop_cnt;
+        u_int                   period;
+
+        u_int                   vtperiod;       /* vt period sequence no */
+        u_int                   parentperiod;   /* parent's vt period seqno */
+        int                     nactive;        /* number of active children */
+
+        /* red and rio related info */
+        int                     qtype;
+        struct redstats         red[3];
+};
+
+--------------------------------------------------------------------------------------------------------
+infoleak in get_class_stats()
+
+priqcmd_class_stats() declares a structure on the stack (struct priq_classstats) populates it, and copies it to userland (copyout()). 
+The structure isn't entirely filled in (and never memset'ed) and hence uninitialized stack data can be copied to userland. 
+
+netbsd\src\sys\altq\Altq_priq.c 
+static int
+priqcmd_class_stats(struct priq_class_stats *ap)
+{
+        struct priq_if *pif;
+        struct priq_class *cl;
+        struct priq_classstats stats, *usp; <-- stats is uninitialized 
+        int     pri, error;
+
+        if ((pif = altq_lookup(ap->iface.ifname, ALTQT_PRIQ)) == NULL)
+                return (EBADF);
+
+        ap->maxpri = pif->pif_maxpri;
+
+        /* then, read the next N classes in the tree */
+        usp = ap->stats;
+        for (pri = 0; pri <= pif->pif_maxpri; pri++) {
+                cl = pif->pif_classes[pri];
+                if (cl != NULL)
+                        get_class_stats(&stats, cl); <-- doesn't guarantee it fills out every element 
+                else
+                        memset(&stats, 0, sizeof(stats));
+                if ((error = copyout((void *)&stats, (void *)usp++, <-- copies to userland 
+                                     sizeof(stats))) != 0)
+                        return (error);
+        }
+        return (0);
+}
+
+
+static void
+get_class_stats(struct priq_classstats *sp, struct priq_class *cl)
+{
+        sp->class_handle = cl->cl_handle;
+        sp->qlength = qlen(cl->cl_q);
+        sp->qlimit = qlimit(cl->cl_q);
+        sp->period = cl->cl_period;
+        sp->xmitcnt = cl->cl_xmitcnt;
+        sp->dropcnt = cl->cl_dropcnt;
+
+        sp->qtype = qtype(cl->cl_q);
+#ifdef ALTQ_RED
+        if (q_is_red(cl->cl_q)) <-- not guaranteed to be initialized
+                red_getstats(cl->cl_red, &sp->red[0]); <-- only initialized first element. red has 3 elements 
+#endif
+#ifdef ALTQ_RIO
+        if (q_is_rio(cl->cl_q)) <-- not guaranteed to be initialized
+                rio_getstats((rio_t *)cl->cl_red, &sp->red[0]);
+#endif
+
+}
+
+netbsd\src\sys\altq\Altq_priq.h 
+struct priq_classstats {
+        u_int32_t               class_handle;
+
+        u_int                   qlength;
+        u_int                   qlimit;
+        u_int                   period;
+        struct pktcntr          xmitcnt;  /* transmitted packet counter */
+        struct pktcntr          dropcnt;  /* dropped packet counter */
+
+        /* red and rio related info */
+        int                     qtype;
+        struct redstats         red[3]; /* rio has 3 red stats */
+};
+
+--------------------------------------------------------------------------------------------------------
+
+signedness bug in wfq_getstats() 
+
+wfq_getstats() is called by an ioctl handler (wfqioctl). its content is of type struct_wfq_getstats which has 
+an element qid (which is signed int) that is used as an index into an array. Before using it as an index there 
+is a boundscheck, however, the boundscheck suffers from a signedness issue. This issue can cause an out of bound read
+which could cause an info leak or possible kernel panic. 
+
+netbsd\src\sys\altq\Altq_wfq.c 
+static int
+wfq_getstats(struct wfq_getstats *gsp) <-- gsp content comes from ioctl
+{
+        wfq_state_t     *wfqp;
+        wfq *queue;
+        queue_stats *stats;
+
+        if ((wfqp = altq_lookup(gsp->iface.wfq_ifacename, ALTQT_WFQ)) == NULL)
+                return (EBADF);
+
+        if (gsp->qid >= wfqp->nums) <-- gsp comes from userland. both qid and nums are signed ints. can make qid negative 
+                return (EINVAL);
+
+        queue = &wfqp->queue[gsp->qid]; <-- will out of bound index if qid is negative. queue now points to some random piece of kernel memory 
+        stats = &gsp->stats;
+
+        stats->bytes            = queue->bytes; <-- can out of bound read. either info leak or kernel panic
+        stats->weight           = queue->weight; <-- can out of bound read. either info leak or kernel panic
+        stats->xmit_cnt         = queue->xmit_cnt; <-- can out of bound read. either info leak or kernel panic
+        stats->drop_cnt         = queue->drop_cnt; <-- can out of bound read. either info leak or kernel panic
+
+        return 0;
+}
+
+--------------------------------------------------------------------------------------------------------
+
+signedness bug -> info leak or kernel panic in mixer_ioctl()
+
+mixer_ioctl() is an ioctl handler. when it handles an AUDIO_MIXER_READ case, it casts the ioctl addr to a 
+mizer_ctrl_t struct. this struct contains an element called dev, which is a signed int. dev is used to index into 
+an array. Before doing so there is a boundscheck to see if dev is within bounds. This boundscheck contains 
+a signedness issue. This issue can cause an out of bound read which could cause an info leak or possible 
+kernel panic. 
+
+netbsd\src\sys\dev\Audio.c 
+int
+mixer_ioctl(struct audio_softc *sc, u_long cmd, void *addr, int flag,
+            struct lwp *l)
+{
+...
+        switch (cmd) {
+...
+        case AUDIO_MIXER_READ:
+                DPRINTF(("AUDIO_MIXER_READ\n"));
+                mc = (mixer_ctrl_t *)addr;
+
+                if (device_is_active(sc->sc_dev))
+                        error = hw->get_port(sc->hw_hdl, mc);
+                else if (mc->dev >= sc->sc_nmixer_states) <-- both are signed int. mc->dev comes from userland and can be negative 
+                        error = ENXIO;
+                else {
+                        int dev = mc->dev;
+                        memcpy(mc, &sc->sc_mixer_state[dev],  <-- out of bound index. can cause info leak or kernel panic 
+                            sizeof(mixer_ctrl_t));
+                        error = 0;
+                }
+                break;
+...
+
+--------------------------------------------------------------------------------------------------------
+signedness bug in generic_get_port
+
+generic_get_port() is called by an ioctl handler. its handed a mixer_ctrl_t struct that came from the ioctl. 
+this struct contains an element called dev, which is a signed int. dev is used to index into 
+an array. Before doing so there is a boundscheck to see if dev is within bounds. This boundscheck contains 
+a signedness issue. This issue can cause an out of bound read which could cause an info leak or possible 
+kernel panic. 
+
+netbsd\src\sys\dev\pci\Azalia_codec.c 
+static int
+generic_get_port(codec_t *this, mixer_ctrl_t *mc)
+{
+        const mixer_item_t *m;
+
+        if (mc->dev >= this->nmixers) <-- signedness bug. both are signed integers. mc->dev comes from userland. 
+                return ENXIO;
+        m = &this->mixers[mc->dev]; <-- can out of bound index. when m is used can cause info leak or kernel panic 
+        mc->type = m->devinfo.type;
+        if (mc->type == AUDIO_MIXER_CLASS)
+                return 0;       /* nothing to do */
+        return generic_mixer_get(this, m->nid, m->target, mc);
+}
+
+same problem in alc882_get_port() and alc260_get_port()
+
+--------------------------------------------------------------------------------------------------------
+signedness bug in ac97_query_devinfo
+
+ac97_query_devinfo is called by an ioctl handler. its handed a mixer_devinfo_t struct that came from the ioctl. 
+this struct contains an element called index, which is a signed int. the index is used to index into an array. 
+Before doing so there is a boundscheck to see if the index is within bounds. This boundscheck contains a 
+signedness issue. This ussue can cause an out of bound read which could cause an info leak or possible kernel panic.
+
+netbsd\src\sys\dev\ic\Ac97.c 
+static int
+ac97_query_devinfo(struct ac97_codec_if *codec_if, mixer_devinfo_t *dip)
+{
+        struct ac97_softc *as;
+        struct ac97_source_info *si;
+        const char *name;
+
+        as = (struct ac97_softc *)codec_if;
+        if (dip->index < as->num_source_info) { <-- signedness bug. both are signed integers. dip->index comes from userland. 
+                si = &as->source_info[dip->index]; <-- can out of bound index. when si is used can cause info leak or kernel panic
+                dip->type = si->type;
+                dip->mixer_class = si->mixer_class;
+                dip->prev = si->prev;
+                dip->next = si->next;
+
+                if (si->qualifier)
+                        name = si->qualifier;
+                else if (si->device)
+                        name = si->device;
+                else if (si->class)
+                        name = si->class;
+                else
+                        name = 0;
+
+                if (name)
+                        strcpy(dip->label.name, name);
+
+                memcpy(&dip->un, si->info, si->info_size);
+
+                /* Set the delta for volume sources */
+                if (dip->type == AUDIO_MIXER_VALUE)
+                        dip->un.v.delta = 1 << (8 - si->bits);
+
+                return 0;
+        }
+
+        return ENXIO;
+}
+
+fixed in openbsd: 
+Revision 1.65 / (download) - annotate - [select for diffs], Sun Jan 13 21:43:01 2008 UTC (9 years, 2 months ago) by deanna 
+Branch: MAIN 
+Changes since 1.64: +2 -2 lines
+Diff to previous 1.64 (colored)
+
+Check for a negative devinfo index, which could get here through
+mixer_ioctl.
+
+ok jakemsr@
+
+--------------------------------------------------------------------------------------------------------
+signess bug in generic_set_port
+
+generic_set_port() is called by an ioctl handler. its handed a mixer_ctrl_t struct that came from the ioctl. 
+this struct contains an element called dev, which is a signed int. dev is used to index into 
+an array. Before doing so there is a boundscheck to see if dev is within bounds. This boundscheck contains 
+a signedness issue. This issue can cause an out of bound read which could cause an info leak or possible 
+kernel panic. 
+
+
+netbsd\src\sys\dev\pci\Azalia_codec.c 
+static int
+generic_set_port(codec_t *this, mixer_ctrl_t *mc)
+{
+        const mixer_item_t *m;
+
+        if (mc->dev >= this->nmixers) <-- signedness bug. both are signed integers. dip->index comes from userland. 
+                return ENXIO;
+        m = &this->mixers[mc->dev]; <-- can out of bound index. when m is used can cause info leak or kernel panic
+        if (mc->type != m->devinfo.type)
+                return EINVAL;
+        if (mc->type == AUDIO_MIXER_CLASS)
+                return 0;       /* nothing to do */
+        return generic_mixer_set(this, m->nid, m->target, mc);
+}
+
+same issue in alc260_set_port() and alc882_set_port()
+
+--------------------------------------------------------------------------------------------------------
+signesness bug in auconv_query_encoding
+
+auconv_query_encoding is called by an ioctl handler. its handed a audio_encoding_t struct that came from the ioctl. 
+this struct contains an element called index, which is a signed int. the index is used to index into an array. 
+Before doing so there is a boundscheck to see if the index is within bounds. This boundscheck contains a 
+signedness issue. This ussue can cause an out of bound read which could cause an info leak or possible kernel panic.
+
+netbsd\src\sys\dev\Auconv.c 
+auconv_query_encoding(const struct audio_encoding_set *encodings,
+                      audio_encoding_t *aep)
+{
+        if (aep->index >= encodings->size) <-- signedness bug. index comes from userland 
+                return EINVAL;
+        strlcpy(aep->name, encodings->items[aep->index].name, <-- can out of bound index. can cause info leak or kernel panic
+                MAX_AUDIO_DEV_LEN);
+        aep->encoding = encodings->items[aep->index].encoding; <-- can out of bound index. can cause info leak or kernel panic
+        aep->precision = encodings->items[aep->index].precision; <-- can out of bound index. can cause info leak or kernel panic
+        aep->flags = encodings->items[aep->index].flags; <-- can out of bound index. can cause info leak or kernel panic
+        return 0;
+}
+
+--------------------------------------------------------------------------------------------------------
+
+integer overflow in kern_malloc()
+
+kern_malloc is the main memory allocation routine. the malloc() macro is defined as kern_malloc(). it contains a classic 
+integer overflow. Any unbound malloc will hit this bug.  
+
+netbsd\src\sys\kern\Kern_malloc.c 
+void *
+kern_malloc(unsigned long size, int flags)
+{
+        const int kmflags = (flags & M_NOWAIT) ? KM_NOSLEEP : KM_SLEEP;
+        size_t allocsize, hdroffset;
+        struct malloc_header *mh;
+        void *p;
+
+        if (size >= PAGE_SIZE) {
+                allocsize = PAGE_SIZE + size; /* for page alignment */ <-- integer overflow 
+                hdroffset = PAGE_SIZE - sizeof(struct malloc_header);
+        } else {
+                allocsize = sizeof(struct malloc_header) + size;
+                hdroffset = 0;
+        }
+
+        p = kmem_intr_alloc(allocsize, kmflags);
+        if (p == NULL)
+                return NULL;
+
+        if ((flags & M_ZERO) != 0) {
+                memset(p, 0, allocsize);
+        }
+        mh = (void *)((char *)p + hdroffset); <-- can be out of bound due to integer overflow 
+        mh->mh_size = allocsize - hdroffset; <-- memory corruption due to integer overflow 
+
+        return mh + 1;
+}
+
+--------------------------------------------------------------------------------------------------------
+integer overflow in cryptof_ioctl CIOCNGSESSION case
+
+The crypto device (/dev/crypto) has an ioctl handler (cryptof_ioctl). when it handles the XXXX case it 
+will use a count element provided by userland to calculate a buffer length and allocate a buffer of that size.
+the buffer length calculation contains an integer overflow. later on when the buffer is used, it can cause 
+memory corruption. 
+
+netbsd\src\sys\opencrypto\Cryptodev.c 
+/* ARGSUSED */
+int
+cryptof_ioctl(struct file *fp, u_long cmd, void *data)
+{
+...
+        switch (cmd) {
+...
+        case CIOCNGSESSION:
+                sgop = (struct crypt_sgop *)data;
+                snop = kmem_alloc((sgop->count *
+                                  sizeof(struct session_n_op)), KM_SLEEP); <-- integer overflow 
+                error = copyin(sgop->sessions, snop, sgop->count *
+                               sizeof(struct session_n_op));
+                if (error) {
+                        goto mbail;
+                }
+
+                mutex_enter(&crypto_mtx);
+                fcr->mtime = fcr->atime;
+                mutex_exit(&crypto_mtx);
+                error = cryptodev_msession(fcr, snop, sgop->count); <-- will corrupt memory here
+                if (error) {
+                        goto mbail;
+...
+}
+
+--------------------------------------------------------------------------------------------------------
+integer overflow in cryptof_ioctl CIOCNFSESSION case
+
+The crypto device (/dev/crypto) has an ioctl handler (cryptof_ioctl). when it handles the CIOCNFSESSION case it 
+will use a count element provided by userland to calculate a buffer length and allocate a buffer of that size.
+the buffer length calculation contains an integer overflow. later on when the buffer is used, it can cause 
+memory corruption. 
+
+netbsd\src\sys\opencrypto\Cryptodev.c 
+/* ARGSUSED */
+int
+cryptof_ioctl(struct file *fp, u_long cmd, void *data)
+{
+...
+        switch (cmd) {
+...
+        case CIOCNFSESSION:
+                mutex_enter(&crypto_mtx);
+                fcr->mtime = fcr->atime;
+                mutex_exit(&crypto_mtx);
+                sfop = (struct crypt_sfop *)data;
+                sesid = kmem_alloc((sfop->count * sizeof(u_int32_t)),  <-- integer overflow 
+                    KM_SLEEP);
+                error = copyin(sfop->sesid, sesid,
+                    (sfop->count * sizeof(u_int32_t)));
+                if (!error) {
+                        error = cryptodev_msessionfin(fcr, sfop->count, sesid); <-- will out of bound read 
+                }
+                kmem_free(sesid, (sfop->count * sizeof(u_int32_t)));
+                break;
+...
+}
+
+--------------------------------------------------------------------------------------------------------
+
+Race condition in cryptof_ioctl()
+
+The crypto device (/dev/crypto) has an ioctl handler (cryptof_ioctl). there is a potential race condition in the
+CIOCCRYPT case. It aquires the crypto mutex to look up a crypto session, but drops the lock after it has found the session. 
+if an CIOCFSESSION ioctl is issued on that session right after that crypto mutex is released, the session will be freed. 
+at this point CIOCCRYPT will be operating on an expired session. this will cause a use after free and possible memory corruption. 
+
+netbsd\src\sys\opencrypto\Cryptodev.c 
+int
+cryptof_ioctl(struct file *fp, u_long cmd, void *data)
+{
+...
+        switch (cmd) {
+...
+        case CIOCFSESSION: <-- [4] find and delete crypto session
+                mutex_enter(&crypto_mtx);
+                fcr->mtime = fcr->atime;
+                ses = *(u_int32_t *)data;
+                cse = csefind(fcr, ses);
+                if (cse == NULL) {
+                        mutex_exit(&crypto_mtx);
+                        return EINVAL;
+                }
+                csedelete(fcr, cse); <-- [4.1] crypto session removed from list
+                mutex_exit(&crypto_mtx);
+                error = csefree(cse); <-- [4.2] crypto session deleted 
+                break;
+...
+        case CIOCCRYPT:
+                mutex_enter(&crypto_mtx); <-- [1] crypto lock aquired 
+                fcr->mtime = fcr->atime;
+                cop = (struct crypt_op *)data;
+                cse = csefind(fcr, cop->ses); <-- [2] found crypto session
+                mutex_exit(&crypto_mtx); <-- [3] crypto lock released 
+                if (cse == NULL) {
+                        DPRINTF(("csefind failed\n"));
+                        return EINVAL;
+                }
+                error = cryptodev_op(cse, cop, curlwp); <-- [5] if session is deleted (issued CIOCFSESSION ioctl between 3 and 5, race condition) then we're now operating on an expired crypto sessions! can cause use after free and memory corruption
+                DPRINTF(("cryptodev_op error = %d\n", error));
+                break;
+...
+}
+
+fix: either refcount cse or cover cryptodev_op() with the lock
+
+--------------------------------------------------------------------------------------------------------
+
+integer overflow in cryptof_ioctl CIOCNCRYPTM case
+
+The crypto device (/dev/crypto) has an ioctl handler (cryptof_ioctl). when it handles the CIOCNCRYPTM case it 
+will use a count element provided by userland to calculate a buffer length and allocate a buffer of that size.
+the buffer length calculation contains an integer overflow. later on when the buffer is used, it can cause 
+memory corruption. 
+
+netbsd\src\sys\opencrypto\Cryptodev.c 
+int
+cryptof_ioctl(struct file *fp, u_long cmd, void *data)
+{
+...
+        switch (cmd) {
+...
+        case CIOCNCRYPTM:
+                mutex_enter(&crypto_mtx);
+                fcr->mtime = fcr->atime;
+                mutex_exit(&crypto_mtx);
+                mop = (struct crypt_mop *)data;
+                cnop = kmem_alloc((mop->count * sizeof(struct crypt_n_op)),  <-- integer overflow 
+                    KM_SLEEP);
+                error = copyin(mop->reqs, cnop,
+                    (mop->count * sizeof(struct crypt_n_op)));
+                if(!error) {
+                        error = cryptodev_mop(fcr, cnop, mop->count, curlwp); <-- can corrupt memory here if integer overflow is triggered 
+...
+}
+
+--------------------------------------------------------------------------------------------------------
+integer overflow in cryptof_ioctl CIOCNFKEYM case
+
+The crypto device (/dev/crypto) has an ioctl handler (cryptof_ioctl). when it handles the CIOCNFKEYM case it 
+will use a count element provided by userland to calculate a buffer length and allocate a buffer of that size.
+the buffer length calculation contains an integer overflow. later on when the buffer is used, it can cause 
+memory corruption. 
+
+netbsd\src\sys\opencrypto\Cryptodev.c 
+
+int
+cryptof_ioctl(struct file *fp, u_long cmd, void *data)
+{
+...
+        switch (cmd) {
+...
+        case CIOCNFKEYM:
+                mutex_enter(&crypto_mtx);
+                fcr->mtime = fcr->atime;
+                mutex_exit(&crypto_mtx);
+                mkop = (struct crypt_mkop *)data;
+                knop = kmem_alloc((mkop->count * sizeof(struct crypt_n_kop)), <-- integer overflow 
+                    KM_SLEEP);
+                error = copyin(mkop->reqs, knop,
+                    (mkop->count * sizeof(struct crypt_n_kop)));
+                if (!error) {
+                        error = cryptodev_mkey(fcr, knop, mkop->count); <-- could read out of bound in case of int overflow and possibly corrupt memory (due to double fetch of out of bound memory)
+                        if (!error)
+                                error = copyout(knop, mkop->reqs,
+                                    (mkop->count * sizeof(struct crypt_n_kop)));
+                }
+                kmem_free(knop, (mkop->count * sizeof(struct crypt_n_kop)));
+                break;
+...
+}
+
+--------------------------------------------------------------------------------------------------------
+integer overflow in cryptof_ioctl CIOCNCRYPTRETM case
+
+The crypto device (/dev/crypto) has an ioctl handler (cryptof_ioctl). when it handles the CIOCNCRYPTRETM case it 
+will use a count element provided by userland to calculate a buffer length and allocate a buffer of that size.
+the buffer length calculation contains an integer overflow. later on when the buffer is used, it can cause 
+memory corruption. 
+
+netbsd\src\sys\opencrypto\Cryptodev.c 
+int
+cryptof_ioctl(struct file *fp, u_long cmd, void *data)
+{
+...
+        case CIOCNCRYPTRETM:
+                mutex_enter(&crypto_mtx);
+                fcr->mtime = fcr->atime;
+                mutex_exit(&crypto_mtx);
+                crypt_ret = (struct cryptret *)data;
+                count = crypt_ret->count;
+                crypt_res = kmem_alloc((count * sizeof(struct crypt_result)),    <-- int overflow 
+                    KM_SLEEP);
+                error = copyin(crypt_ret->results, crypt_res,
+                    (count * sizeof(struct crypt_result)));
+                if (error)
+                        goto reterr;
+                crypt_ret->count = cryptodev_getmstatus(fcr, crypt_res,
+                    crypt_ret->count);  <-- memory corruption in case of integer overflow 
+                /* sanity check count */
+                if (crypt_ret->count > count) {
+                        printf("%s.%d: error returned count %zd > original "
+                            " count %zd\n",
+                            __FILE__, __LINE__, crypt_ret->count, count);
+                        crypt_ret->count = count;
+
+                }
+                error = copyout(crypt_res, crypt_ret->results,
+                    (crypt_ret->count * sizeof(struct crypt_result)));
+reterr:
+                kmem_free(crypt_res, (count * sizeof(struct crypt_result)));
+                break;
+...
+}
+
+--------------------------------------------------------------------------------------------------------
+infoleak in ocryptodev_session() 
+
+ocryptodev_session() is called by ocryptodev_msession() which is called by the crypto device's ioctl handler. 
+ocryptodev_session() copies data in a heap provided buffer of type struct osession_op *. one of it's elements is a 
+sessions number. this is queried by calling cryptodev_session() with a struct session_op structure (uninitialized, declared on the stack). 
+if cryptodev_session() fails, the session number is uninitialized (stack data) and copied to the provided 
+heap buffer. This is later copied to userland.  
+
+netbsd\src\sys\opencrypto\cryptodev.c 
+static int
+ocryptodev_session(struct fcrypt *fcr, struct osession_op *osop) 
+{
+        struct session_op sop; <-- uninitialized struct 
+        int res;
+
+        sop.cipher = osop->cipher;
+        sop.mac = osop->mac;
+        sop.comp_alg = 0;
+        sop.keylen = osop->keylen;
+        sop.key = osop->key;
+        sop.mackeylen = osop->mackeylen;
+        sop.mackey = osop->mackey;
+        res = cryptodev_session(fcr, &sop); <-- if this fails sop.ses is never initialized 
+        osop->ses = sop.ses; <-- leak uninitialized stack data to userland  
+        return res;
+
+}
+
+--------------------------------------------------------------------------------------------------------
+
+integer overflow in cryptof_ioctl CIOCNGSESSION case
+
+The crypto device (/dev/crypto) has an ioctl handler (cryptof_ioctl). when it handles the CIOCNGSESSION case it 
+will use a count element provided by userland to calculate a buffer length and allocate a buffer of that size.
+the buffer length calculation contains an integer overflow. later on when the buffer is used, it can cause 
+memory corruption. 
+
+netbsd\src\sys\opencrypto\cryptodev.c 
+int
+ocryptof_ioctl(struct file *fp, u_long cmd, void *data)
+{
+...
+        switch (cmd) {
+...
+        case CIOCNGSESSION:
+                osgop = (struct ocrypt_sgop *)data;
+                osnop = kmem_alloc((osgop->count *
+                                  sizeof(struct osession_n_op)), KM_SLEEP); <-- int overflow
+                error = copyin(osgop->sessions, osnop, osgop->count *
+                               sizeof(struct osession_n_op));
+                if (error) {
+                        goto mbail;
+                }
+
+                error = ocryptodev_msession(fcr, osnop, osgop->count); <-- memory corruption in case of int overflow
+...
+}
+
+--------------------------------------------------------------------------------------------------------
+
+integer overflow in cryptof_ioctl OCIOCNCRYPTM case
+
+The crypto device (/dev/crypto) has an ioctl handler (cryptof_ioctl). when it handles the OCIOCNCRYPTM case it 
+will use a count element provided by userland to calculate a buffer length and allocate a buffer of that size.
+the buffer length calculation contains an integer overflow. later on when the buffer is used, it can cause 
+memory corruption. 
+
+netbsd\src\sys\opencrypto\cryptodev.c 
+int
+ocryptof_ioctl(struct file *fp, u_long cmd, void *data)
+{
+...
+        switch (cmd) {
+...
+        case OCIOCNCRYPTM:
+                omop = (struct ocrypt_mop *)data;
+                ocnop = kmem_alloc((omop->count * sizeof(struct ocrypt_n_op)), <-- integer overflow 
+                    KM_SLEEP);
+                error = copyin(omop->reqs, ocnop,
+                    (omop->count * sizeof(struct ocrypt_n_op)));
+                if(!error) {
+                        error = ocryptodev_mop(fcr, ocnop, omop->count, curlwp); <-- memory corruption in case of integer overflow 
+                        if (!error) {
+                                error = copyout(ocnop, omop->reqs, 
+                                    (omop->count * sizeof(struct ocrypt_n_op)));
+                        }
+                }
+                kmem_free(ocnop, (omop->count * sizeof(struct ocrypt_n_op)));
+                break;  
+...
+}
+
+--------------------------------------------------------------------------------------------------------
+no length validation in smb_usr_vc2spec() can cause out of bound read. 
+
+smb_usr_vc2spec() is called by an ioctl handler. its handed a struct smbioc_ossn, the content of which is controlled by userland. 
+the content contains 2 pointers and 2 length fields. they're used to copy data from user to kernel. a buffer will be allocated based 
+on the provided lengths, data will be copied, and the pointer will then be seen as a struct sockaddr *. 
+
+There are 2 issues here: 
+1) there is no check to see if the length is at least large enough to hold a minimal struct sockaddr (can cause out of bound read) 
+2) the sockaddr length field is never validated. userland can lie about this. 
+
+If these issues are triggered, they could cause out of bound reads 
+
+netbsd\src\sys\netsmb\Smb_usr.c 
+static int
+smb_usr_vc2spec(struct smbioc_ossn *dp, struct smb_vcspec *spec)
+{
+        int flags = 0;
+
+        memset(spec, 0, sizeof(*spec));
+        if (dp->ioc_user[0] == 0)
+                return EINVAL;
+        if (dp->ioc_server == NULL)
+                return EINVAL;
+        if (dp->ioc_localcs[0] == 0) {
+                SMBERROR(("no local charset ?\n"));
+                return EINVAL;
+        }
+
+        spec->sap = smb_memdupin(dp->ioc_server, dp->ioc_svlen); <-- need to validate minimum sockaddr len. else out of bound reads can occur. also need to validate sockaddr.sa_len len to make sure no out of bound reads can occur
+        if (spec->sap == NULL)
+                return ENOMEM;
+        if (dp->ioc_local) {
+                spec->lap = smb_memdupin(dp->ioc_local, dp->ioc_lolen); <-- need to validate minimum sockaddr len. else out of bound reads can occur. also need to validate sockaddr.sa_len len to make sure no out of bound reads can occur
+                if (spec->lap == NULL) {
+                        smb_usr_vcspec_free(spec);
+                        return ENOMEM;
+                }
+        }
+...
+}
+
+--------------------------------------------------------------------------------------------------------
+signedness bug in smb_usr_t2request() can cause out of bound read 
+
+smb_usr_t2request() is called by an ioctl handler. its handed a struct mbioc_t2rq, the content of which is controlled by userland.
+the structure contains an element called ioc_setupcnt which is a signed int. There is a boundscheck performed to see if it's larger 
+than 3 (and if so, bails out). However, since its a signed int, it can be negative. 
+
+after this a smb_t2rq structure is allocated that will be filled in. it contains a t2 length field and a t2 data pointer. the t2 length will be 
+assigned the previously described length. the data pointer will point to a buffer that is at most 3 bytes long. 
+
+this struct is used to fill out a request and send it over the network. if t2 length is larger than 3 (due to the signedness bug) those amount of 
+bytes will be send over the network, even though the source buffer isn't large enough. This can cause an out of bound read and will either info 
+leak over the network, or cause a kernel panic.  
+
+netbsd\src\sys\netsmb\Smb_usr.c 
+int
+smb_usr_t2request(struct smb_share *ssp, struct smbioc_t2rq *dp, <--comes from user 
+        struct smb_cred *scred)
+{
+        struct smb_t2rq *t2p;
+        struct mdchain *mdp;
+        int error, len;
+
+        if (dp->ioc_setupcnt > 3) <-- signedness bug, can have this be negative 
+                return EINVAL;
+        error = smb_t2_alloc(SSTOCP(ssp), dp->ioc_setup[0], scred, &t2p);
+        if (error)
+                return error;
+        len = t2p->t2_setupcount = dp->ioc_setupcnt; <-- t2_setupcount is a uint16, hence can be a positive number larger than 3
+        if (len > 1)  
+                t2p->t2_setupdata = dp->ioc_setup;
+        if (dp->ioc_name) {
+                t2p->t_name = smb_strdupin(dp->ioc_name, 128);
+                if (t2p->t_name == NULL) {
+                        error = ENOMEM;
+                        goto bad;
+                }
+        }
+...
+        error = smb_t2_request(t2p); <-- can out of bound read if t2p->t2_setupcount is larger than 3
+...
+}
+
+--------------------------------------------------------------------------------------------------------
+out of bound read in ciss_ioctl_vol()
+
+ciss_ioctl_vol() is called by an ioctl handler. its handed a struct bioc_vol structure, the content of which is controlled by 
+userland. the struct contains an element bv_volid which is a signed int. it's used as an index into an array. Before it's 
+used as an index there is a boundscheck. However, the boundscheck has a signedness bug. this signedness bug can cause an out of bound read, 
+which can either infoleak or cause a panic. 
+
+netbsd\src\sys\dev\ic\Ciss.c 
+int
+ciss_ioctl_vol(struct ciss_softc *sc, struct bioc_vol *bv)
+{
+        struct ciss_ldid *ldid;
+        struct ciss_ld *ldp;
+        struct ciss_ldstat *ldstat;
+        struct ciss_pdid *pdid;
+        int error = 0;
+        u_int blks;
+
+        if (bv->bv_volid > sc->maxunits) { <-- signedness bug
+                return EINVAL;
+        }
+        ldp = sc->sc_lds[bv->bv_volid]; <-- can out of bound read if signedness bug is triggered 
+...
+}
+
+--------------------------------------------------------------------------------------------------------
+signedness bug in ciss_ioctl() 
+
+ciss_ioctl() is an ioctl handler. when it handles the BIOCDISK ioctl it sees the ioctl input as a struct bioc_disk.
+this structure contains an element called bd_diskid, which is a signed int. it's used as an index into an array. Before it's 
+used as an index there is a boundscheck. However, the boundscheck has a signedness bug. this signedness bug can cause 
+an out of bound read, which can either infoleak or cause a panic. 
+
+netbsd\src\sys\dev\ic\Ciss.c 
+int
+ciss_ioctl(device_t dev, u_long cmd, void *addr)
+{
+...
+        switch (cmd) {
+...
+        case BIOCDISK:
+                bd = (struct bioc_disk *)addr;
+                if (bd->bd_volid > sc->maxunits) {
+                        error = EINVAL;
+                        break;
+                }
+                ldp = sc->sc_lds[0];
+                if (!ldp || (pd = bd->bd_diskid) > ldp->ndrives) { <-- signedness bug
+                        error = EINVAL;
+                        break;
+                }
+...
+                if (ldstat->stat == CISS_LD_REBLD &&
+                    ldstat->bigrebuild == ldp->tgts[pd]) <-- out of bound read
+                        bd->bd_status = BIOC_SDREBUILD;
+...
+}
+
+--------------------------------------------------------------------------------------------------------
+unvalidated channel index in ISP_FC_GETDLIST case of ispioctl() can cause out of bound read
+
+ispioctl() is an ioctl handler. from userland, it copies an unsigned 16 bit integer, called channel. this channel is then passed 
+to isp_control() with a control value of ISPCTL_GET_NAMES. in that case the channel is used as an index into an array, without 
+performing any boundschecks. this can cause an out of bound read and trigger a panic. 
+
+netbsd\src\sys\dev\ic\Isp_netbsd.c 
+static int
+ispioctl(struct scsipi_channel *chan, u_long cmd, void *addr, int flag,
+        struct proc *p)
+{
+        struct ispsoftc *isp = device_private(chan->chan_adapter->adapt_dev);
+        int nr, bus, retval = ENOTTY;
+
+        switch (cmd) {
+...
+        case ISP_FC_GETDLIST:
+        {
+                isp_dlist_t local, *ua;
+                uint16_t nph, nphe, count, channel, lim;
+                struct wwnpair pair, *uptr;
+
+                if (IS_SCSI(isp)) {
+                        retval = EINVAL;
+                        break;
+                }
+
+                ua = *(isp_dlist_t **)addr;
+                if (copyin(ua, &local, sizeof (isp_dlist_t))) {
+                        retval = EFAULT;
+                        break;
+                }
+                lim = local.count;
+                channel = local.channel;
+
+                ua = *(isp_dlist_t **)addr;
+                uptr = &ua->wwns[0];
+
+                if (ISP_CAP_2KLOGIN(isp)) {
+                        nphe = NPH_MAX_2K;
+                } else {
+                        nphe = NPH_MAX;
+                }
+                for (count = 0, nph = 0; count < lim && nph != nphe; nph++) {
+                        ISP_LOCK(isp);
+                        retval = isp_control(isp, ISPCTL_GET_NAMES, channel, <-- need to validate channel before use. can cause out of bound read 
+                            nph, &pair.wwnn, &pair.wwpn);
+                        ISP_UNLOCK(isp);
+                        if (retval || (pair.wwpn == INI_NONE &&
+                            pair.wwnn == INI_NONE)) {
+                                retval = 0;
+                                continue;
+                        }
+                        if (copyout(&pair, (void *)uptr++, sizeof (pair))) {
+                                retval = EFAULT;
+                                break;
+                        }
+                        count++;
+                }
+...
+}
+--------------------------------------------------------------------------------------------------------
+infoleak in ktruser() if copyin fails. 
+
+ktruser() is called to add a user defined entry to ktrace. userland provides it a pointer and a length. 
+ktruser() will then allocate a ktace entry with additional space for the content from userland. 
+when the copyin is done to copy that data from userland, and the copyin fails (e.g. unmapped page) the uninitialized 
+ktrace buffer is still written out! 
+
+netbsd\src\sys\kern\Kern_ktrace.c 
+int
+ktruser(const char *id, void *addr, size_t len, int ustr)
+{
+        struct ktrace_entry *kte;
+        struct ktr_user *ktp;
+        lwp_t *l = curlwp;
+        void *user_dta;
+        int error;
+
+        if (!KTRPOINT(l->l_proc, KTR_USER))
+                return 0;
+
+        if (len > KTR_USER_MAXLEN)
+                return ENOSPC;
+
+        error = ktealloc(&kte, (void *)&ktp, l, KTR_USER, sizeof(*ktp) + len);
+        if (error != 0)
+                return error;
+
+        if (ustr) {
+                if (copyinstr(id, ktp->ktr_id, KTR_USER_MAXIDLEN, NULL) != 0)
+                        ktp->ktr_id[0] = '\0';
+        } else
+                strncpy(ktp->ktr_id, id, KTR_USER_MAXIDLEN);
+        ktp->ktr_id[KTR_USER_MAXIDLEN-1] = '\0';
+
+        user_dta = (void *)(ktp + 1);
+        if ((error = copyin(addr, (void *)user_dta, len)) != 0) <-- if the copyin() fails the buffer will contain uninitialized heap data, which will then get logged 
+                len = 0;
+
+        ktraddentry(l, kte, KTA_WAITOK);
+        return error;
+}
+
+
+---------------------------------------------------------------------------------------------------------------------------
+puffs userland can trigger panic in compat getdents 
+
+a whole bunch of the compat getdents functions call VOP_READDIR() and then call panic if the record length isn't 4-byte aligned. 
+using puffs, a userland driver could provide such a record. 
+
+netbsd\src\sys\compat\linux32\common\Linux32_dirent.c 
+int
+linux32_sys_getdents(struct lwp *l, const struct linux32_sys_getdents_args *uap, register_t *retval)
+{
+...
+        char *inp, *tbuf;               /* BSD-format */
+        int len, reclen;                /* BSD-format */
+...
+        struct uio auio;
+        struct iovec aiov;
+...
+        aiov.iov_base = tbuf;
+        aiov.iov_len = buflen;
+...
+        error = VOP_READDIR(vp, &auio, fp->f_cred, &eofflag, &cookiebuf,
+            &ncookies);
+...
+        inp = tbuf;
+...
+        for (cookie = cookiebuf; len > 0; len -= reclen) {
+                bdp = (struct dirent *)inp;
+                reclen = bdp->d_reclen; <-- data comes from filesystem. 
+                if (reclen & 3)  <-- data comes from filesystem
+                        panic("linux32_readdir"); <-- puffs/fuse can trigger this panic 
+...
+}
+
+same issue in 
+- linux_sys_getdents64()
+- linux_sys_getdents()
+- compat_12_sys_getdirentries()
+- compat_43_sys_getdirentries()
+- ibcs2_sys_getdents()
+- ibcs2_sys_read() 
+- linux32_sys_getdents()
+- osf1_sys_getdirentries()
+- sunos32_sys_getdents()
+- sunos_sys_getdents()
+- svr4_32_sys_getdents64()
+- svr4_32_sys_getdents()
+- svr4_sys_getdents64()
+- svr4_sys_getdents()
+- compat_30_sys_getdents()
+
+---------------------------------------------------------------------------------------------------------------------------
+out of bound read in getcwd_scandir()
+
+getcwd_scandir() performs a VOP_READDIR() and then proceeds to parse the data it got back. This data can be provided by a userland 
+puffs driver. when it's looping over the data it back, it parses the data one directory entry at a time. Each directory entry 
+contains a d_namlen. There is no check to see if if d_namlen isn't bogus (larger than the provided data). This can cause out of 
+bound reads, leading to infoleaks or panics. 
+
+netbsd\src\sys\kern\Vfs_getcwd.c 
+static int
+getcwd_scandir(struct vnode **lvpp, struct vnode **uvpp, char **bpp,
+    char *bufp, struct lwp *l)
+{
+...
+                iov.iov_base = dirbuf;
+                iov.iov_len = dirbuflen;
+
+                uio.uio_iov = &iov;
+                uio.uio_iovcnt = 1;
+                uio.uio_offset = off;
+                uio.uio_resid = dirbuflen;
+                uio.uio_rw = UIO_READ;
+                UIO_SETUP_SYSSPACE(&uio);
+...
+                error = VOP_READDIR(uvp, &uio, cred, &eofflag, 0, 0); <-- can come from puffs/fuse 
+...
+                        for (len = (dirbuflen - uio.uio_resid); len > 0;
+                            len -= reclen) {
+                                dp = (struct dirent *) cpos;
+                                reclen = dp->d_reclen;
+
+                                /* check for malformed directory.. */
+                                if (reclen < _DIRENT_MINSIZE(dp)) {
+                                        error = EINVAL;
+                                        goto out;
+                                }
+                                /*
+                                 * XXX should perhaps do VOP_LOOKUP to
+                                 * check that we got back to the right place,
+                                 * but getting the locking games for that
+                                 * right would be heinous.
+                                 */
+                                if ((dp->d_type != DT_WHT) &&
+                                    (dp->d_fileno == fileno)) {
+                                        char *bp = *bpp;
+
+                                        bp -= dp->d_namlen;
+                                        if (bp <= bufp) {
+                                                error = ERANGE;
+                                                goto out;
+                                        }
+                                        memcpy(bp, dp->d_name, dp->d_namlen); <-- d_namlen is unvalidated. can read out of bound and panic or infoleak 
+                                        error = 0;
+                                        *bpp = bp;
+                                        goto out;
+                                }
+                                cpos += reclen;
+                        }
+...
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+out of bound read in exec_ibcs2_coff_prep_zmagic() 
+
+exec_ibcs2_coff_prep_zmagic() reads sections of the coff file from disk, and then parses them. at some point it parses the shared libraries. 
+it contains a shared library name as a string. However, there is no check to guarantee there is a terminating 0-byte. This can cause out of bound 
+reads leading to panics and possibly information leaks. 
+
+netbsd\src\sys\compat\ibcs2\Ibcs2_exec_coff.c 
+int
+exec_ibcs2_coff_prep_zmagic(struct lwp *l, struct exec_package *epp, struct coff_filehdr *fp, struct coff_aouthdr *ap)
+{
+...
+                error = vn_rdwr(UIO_READ, epp->ep_vp, tbuf,
+                                len, sh.s_scnptr,
+                                UIO_SYSSPACE, IO_NODELOCKED, l->l_cred,
+                                &resid, NULL);
+...
+                bufp = tbuf;
+                while (len) {
+                        slhdr = (struct coff_slhdr *)bufp;
+...
+                        error = coff_load_shlib(l, slhdr->sl_name, epp); <-- slhdr->sl_name not guaranteed to be 0-terminated. can read out of bound and panic or possibly infoleak 
+...
+                }
+...
+}
+
+
+---------------------------------------------------------------------------------------------------------------------------
+possible out of bound read in exec_ibcs2_coff_prep_zmagic() 
+
+exec_ibcs2_coff_prep_zmagic()  loops over the coff_slhdr's that were read from disk. At the beginning of each iteration there is 
+only a guarantee that there is 1 byte available, however, the code assumes there are at least sizeof(coff_slhdr) bytes availble. 
+a carefully constructed coff file could be created to trigger this issue, possibly causing an out of bound read and triggering a 
+kernel panic.
+
+netbsd\src\sys\compat\ibcs2\Ibcs2_exec_coff.c 
+int
+exec_ibcs2_coff_prep_zmagic(struct lwp *l, struct exec_package *epp, struct coff_filehdr *fp, struct coff_aouthdr *ap)
+{
+...
+        error = coff_find_section(l, epp->ep_vp, fp, &sh, COFF_STYP_SHLIB);
+...
+                size_t len = sh.s_size, /* path_index, */ entry_len;
+
+                if (len > 64 * 1024)
+                        return ENOEXEC;
+
+                tbuf = malloc(len, M_TEMP, M_WAITOK);
+...
+                error = vn_rdwr(UIO_READ, epp->ep_vp, tbuf,
+                                len, sh.s_scnptr,
+                                UIO_SYSSPACE, IO_NODELOCKED, l->l_cred,
+                                &resid, NULL);
+...
+                bufp = tbuf;
+                while (len) {
+                        slhdr = (struct coff_slhdr *)bufp; <-- no guarantee there are coff_slhdr bytes left to read. need to check that len is atleast sizeof(coff_slhdr) !!!
+
+                        if (slhdr->path_index > LONG_MAX / sizeof(long) ||
+                            slhdr->entry_len > LONG_MAX / sizeof(long)) {
+                                free(tbuf, M_TEMP);
+                                return ENOEXEC;
+                        }
+...
+                }
+...
+}
+
+
+---------------------------------------------------------------------------------------------------------------------------
+
+endless loop in exec_ibcs2_coff_prep_zmagic
+
+exec_ibcs2_coff_prep_zmagic()  loops over the coff_slhdr's that were read from disk. this header contains an entry length. 
+this length is used to skip to the next entry on the next iteration. There is no check to see if the entry length is 0. 
+if the entry length is 0 the slhdr pointer is never moved forward and an endless loop will occur. 
+
+
+netbsd\src\sys\compat\ibcs2\Ibcs2_exec_coff.c 
+int
+exec_ibcs2_coff_prep_zmagic(struct lwp *l, struct exec_package *epp, struct coff_filehdr *fp, struct coff_aouthdr *ap)
+{
+...
+                error = vn_rdwr(UIO_READ, epp->ep_vp, tbuf,
+                                len, sh.s_scnptr,
+                                UIO_SYSSPACE, IO_NODELOCKED, l->l_cred,
+                                &resid, NULL);
+...
+                bufp = tbuf;
+                while (len) {
+                        slhdr = (struct coff_slhdr *)bufp;
+
+                        if (slhdr->path_index > LONG_MAX / sizeof(long) ||
+                            slhdr->entry_len > LONG_MAX / sizeof(long)) { <-- if entry_len is 0
+                                free(tbuf, M_TEMP);
+                                return ENOEXEC;
+                        }
+
+                        /* path_index = slhdr->path_index * sizeof(long); */
+                        entry_len = slhdr->entry_len * sizeof(long); <-- entry_len is 0
+
+                        if (entry_len > len) {
+                                free(tbuf, M_TEMP);
+                                return ENOEXEC;
+                        }
+...
+                        bufp += entry_len; 
+                        len -= entry_len; <-- will cause endless loop 
+                }
+...
+}
+
+---------------------------------------------------------------------------------------------------------------------------
+int overflows / truncation issues in vndioctl can cause memory corruption 
+
+in the VNDIOCSET case in vndioctl() a compressed header is read from disk. that header contains a 32bit unsigned int that 
+indicates the number of compressed block offsets. its used in a buffer length calculation that is passed to malloc(). This 
+calculation contains an integer overflow. 
+
+Once the buffer is allocated, data is read into it using vn_rdwr(). the length passed here could int truncate. 
+
+additionaly, if the number of compressed block offsets is 0, there is an integer underflow. this too can lead to memory corruption. 
+
+netbsd\src\sys\dev\Vnd.c 
+static int
+vndioctl(dev_t dev, u_long cmd, void *data, int flag, struct lwp *l)
+{
+...
+        switch (cmd) {
+...
+        case VNDIOCSET:
+...
+#ifdef VND_COMPRESSION
+...
+                        ch = malloc(sizeof(struct vnd_comp_header),
+                        M_TEMP, M_WAITOK);
+...
+                        error = vn_rdwr(UIO_READ, nd.ni_vp, (void *)ch,
+                          sizeof(struct vnd_comp_header), 0, UIO_SYSSPACE,
+                          IO_UNIT|IO_NODELOCKED, l->l_cred, NULL, NULL);
+...
+                        vnd->sc_comp_numoffs = ntohl(ch->num_blocks)+1; <-- can overflow to 0
+...
+                        if (sizeof(struct vnd_comp_header) +
+                          sizeof(u_int64_t) * vnd->sc_comp_numoffs >
+                          vattr.va_size) {  <-- can overflow!
+                                VOP_UNLOCK(nd.ni_vp);
+                                error = EINVAL;
+                                goto close_and_exit;
+                        }
+...
+                        vnd->sc_comp_offsets =
+                        malloc(sizeof(u_int64_t) * vnd->sc_comp_numoffs,  <-- can overflow 
+                        M_DEVBUF, M_WAITOK);
+...
+                        error = vn_rdwr(UIO_READ, nd.ni_vp,
+                          (void *)vnd->sc_comp_offsets,
+                          sizeof(u_int64_t) * vnd->sc_comp_numoffs, <-- can overflow on 32bit, can int truncate on 64bits
+                          sizeof(struct vnd_comp_header), UIO_SYSSPACE,
+                          IO_UNIT|IO_NODELOCKED, l->l_cred, NULL, NULL);
+...
+                        for (i = 0; i < vnd->sc_comp_numoffs - 1; i++) {  <-- if above int overflow is triggered, there will be memory corruption in this loop. also, if sc_comp_numoffs is 0, there will be int underflow here, also leading to memory corruption 
+                                vnd->sc_comp_offsets[i] = 
+                                  be64toh(vnd->sc_comp_offsets[i]);
+                                comp_size = be64toh(vnd->sc_comp_offsets[i + 1])
+                                  - vnd->sc_comp_offsets[i];
+                                if (comp_size > comp_maxsize)
+                                        comp_maxsize = comp_size;
+                        }
+...
+
+---------------------------------------------------------------------------------------------------------------------------
+issues in Svr4 stream support
+
+ti_bind() gets called from a stream ioctl. it copies in a svr4_strmcmd structure from userland. 
+if this is an AF_INET stream the struct is passed on to netaddr_to_sockaddr_in(). 
+
+the struct contains a long offset that is used but never validated! this can cause out of bound reads 
+and trigger an info leak or kernel panic 
+
+usr\src\sys\compat\svr4\Svr4_stream.c
+static int
+ti_bind(file_t *fp, int fd, struct svr4_strioctl *ioc, struct lwp *l)
+{
+...
+        struct svr4_strmcmd bnd;
+...
+        if (ioc->len > sizeof(bnd))
+                return EINVAL;
+
+        if ((error = copyin(NETBSD32PTR(ioc->buf), &bnd, ioc->len)) != 0)
+                return error;
+...
+        switch (st->s_family) {
+        case AF_INET:
+...
+                netaddr_to_sockaddr_in(&sain, &bnd);
+...
+        }
+...
+}
+
+
+usr\src\sys\compat\svr4\Svr4_stropts.h
+struct svr4_strmcmd {
+        long    cmd;            /* command ?             */
+        long    len;            /* Address len           */
+        long    offs;           /* Address offset       */  <-- 32bit long!
+        long    pad[61];
+};
+
+
+usr\src\sys\compat\svr4\Svr4_stream.c
+#define SVR4_C_ADDROF(sc) (const void *) (((const char *) (sc)) + (sc)->offs) 
+...
+static void netaddr_to_sockaddr_in(struct sockaddr_in *sain, const struct svr4_strmcmd *sc)
+{
+        const struct svr4_netaddr_in *na;
+
+
+        na = SVR4_C_ADDROF(sc); <-- could point to anywhere in memory 
+        memset(sain, 0, sizeof(*sain));
+        sain->sin_len = sizeof(*sain);
+        sain->sin_family = na->family; <-- crash
+        sain->sin_port = na->port; <-- crash 
+        sain->sin_addr.s_addr = na->addr; <-- crash 
+        DPRINTF(("netaddr -> sockaddr_in %d %d %x\n", sain->sin_family,
+                 sain->sin_port, sain->sin_addr.s_addr));
+}
+
+
+usr\src\sys\compat\svr4\Svr4_stropts.h
+#define SVR4_C_ADDROF(sc) (const void *) (((const char *) (sc)) + (sc)->offs) 
+
+
+
+
+
+same (but for unix domain sockets): 
+static void
+netaddr_to_sockaddr_un(struct sockaddr_un *saun, const struct svr4_strmcmd *sc)
+{
+        const struct svr4_netaddr_un *na;
+        char *dst, *edst = &saun->sun_path[sizeof(saun->sun_path) - 1];
+        const char *src;
+
+        na = SVR4_C_ADDROF(sc); <-- could point to anywhere in memory 
+        memset(saun, 0, sizeof(*saun));
+        saun->sun_family = na->family;
+        for (src = na->path, dst = saun->sun_path; (*dst++ = *src++) != '\0'; )
+                if (dst == edst)
+                        break;
+        saun->sun_len = dst - saun->sun_path;
+        DPRINTF(("netaddr -> sockaddr_un %d %s\n", saun->sun_family,
+                 saun->sun_path));
+}
+
+
+
+
+---------------------------------------------------------------------------------------------
+infoleak in svr4_sys__lwp_info()
+
+svr4_sys__lwp_info() fills out an svr4_lwpinfo structure and copies it out to userland. 
+the structure contains 64 long pad values that are never initialized, and hence uninitialized stack
+data is copied to userland. 
+
+usr\src\sys\compat\svr4\Svr4_lwp.c
+int
+svr4_sys__lwp_info(struct lwp *l, const struct svr4_sys__lwp_info_args *uap, register_t *retval)
+{
+        struct svr4_lwpinfo lwpinfo; <-- should memset before use 
+        int error;
+
+        /* XXX NJWLWP */
+        TIMEVAL_TO_TIMESPEC(&l->l_proc->p_stats->p_ru.ru_stime, &lwpinfo.lwp_stime);
+        TIMEVAL_TO_TIMESPEC(&l->l_proc->p_stats->p_ru.ru_utime, &lwpinfo.lwp_utime);
+
+        if ((error = copyout(&lwpinfo, SCARG(uap, lwpinfo), sizeof(lwpinfo))) ==
+            -1) <-- infoleak
+               return error;
+        return 0;
+}
+
+usr\src\sys\compat\svr4\Svr4_lwp.h
+struct svr4_lwpinfo {
+        svr4_timestruc_t        lwp_utime;
+        svr4_timestruc_t        lwp_stime;
+        long                    lwpinfo_pad[64]; <-- never cleared in svr4_sys__lwp_info(), leaks 256 bytes of uninit stack data
+};
+
+---------------------------------------------------------------------------------------------
+
+large value passed to malloc() in svr4_sys_getdents due to signedness bug in svr4_sys_getdents()
+
+svr4_sys_getdents() is a syscall that takes a length variable as input (nbytes). nbytes is a signed int. 
+there is an upperbound check done to make sure no unbound malloc occurs. the boundscheck suffers from a 
+signedness issue. 
+
+usr\src\sys\compat\svr4\Svr4_misc.c
+int
+svr4_sys_getdents(struct lwp *l, const struct svr4_sys_getdents_args *uap, register_t *retval)
+{
+...
+        buflen = min(MAXBSIZE, SCARG(uap, nbytes)); <-- nbytes is signed int 
+        tbuf = malloc(buflen, M_TEMP, M_WAITOK); <-- _LARGE_ value passed to malloc, iirc netbsd will panic on that 
+...
+}
+
+---------------------------------------------------------------------------------------------
+signal overindex issues in svr4 compat layer. 
+
+there are several syscalls in the svr4 compat layer that take a signal number as input, pass it to SVR4_SIGNO() and then use 
+that value to index into the svr4_to_native_signo[] array. SVR4_SIGNO() guarantees the value it returns is between 0-255, 
+however, svr4_to_native_signo[] only contains 64 elements, allowing out of bound reads. 
+
+usr\src\sys\compat\svr4\Svr4_signal.c
+int
+svr4_sys_sigaction(struct lwp *l, const struct svr4_sys_sigaction_args *uap, register_t *retval)
+{
+        /* {
+                syscallarg(int) signum;
+                syscallarg(const struct svr4_sigaction *) nsa;
+                syscallarg(struct svr4_sigaction *) osa;
+        } */
+        error = sigaction1(l, svr4_to_native_signo[SVR4_SIGNO(SCARG(uap, signum))],  <-- overindexes. SVR4_SIGNO() macro allows 0-255, while svr4_to_native_signo[] array only support 0-63
+            SCARG(uap, nsa) ? &nbsa : 0, SCARG(uap, osa) ? &obsa : 0,
+            NULL, 0);
+...
+}
+
+usr\src\sys\compat\svr4\Svr4_signal.h
+
+#define SVR4_NSIG       64
+
+#define SVR4_SIGNO_MASK         0x00FF
+...
+#define SVR4_SIGNO(a)   ((a) & SVR4_SIGNO_MASK)
+
+
+
+usr\src\sys\compat\svr4\Svr4_signo.c
+
+const int svr4_to_native_signo[SVR4_NSIG] = {
+        0,                      /* 0 */
+        SIGHUP,                 /* 1 */
+...
+        SIGRTMIN + 30,          /* 62 */
+        0,                      /* 63 */
+};
+
+
+
+same issues in svr4_sys_signal():
+int
+svr4_sys_signal(struct lwp *l, const struct svr4_sys_signal_args *uap, register_t *retval)
+{
+        /* {
+                syscallarg(int) signum;
+                syscallarg(svr4_sig_t) handler;
+        } */
+        int signum = svr4_to_native_signo[SVR4_SIGNO(SCARG(uap, signum))];
+...
+}
+
+and one other: 
+
+int
+svr4_sys_kill(struct lwp *l, const struct svr4_sys_kill_args *uap, register_t *retval)
+{
+        /* {
+                syscallarg(int) pid;
+                syscallarg(int) signum;
+        } */
+        struct sys_kill_args ka;
+
+        SCARG(&ka, pid) = SCARG(uap, pid);
+        SCARG(&ka, signum) = svr4_to_native_signo[SVR4_SIGNO(SCARG(uap, signum))];
+        return sys_kill(l, &ka, retval);
+}
+
+---------------------------------------------------------------------------------------------
+
+Unbalanced refcount increase in svr4_sys_putmsg(). 
+
+when svr4_sys_putmsg() handles SVR4_TI_SENDTO_REQUEST and SVR4_TI_CONNECT_REQUEST it doesn't drop a file 
+descriptor refcount that was previously aquired. This will cause a leak, and if triggered ~2**32 (refcount overflow)
+a possible use after free. 
+
+usr\src\sys\compat\svr4\Svr4_stream.c
+
+int
+svr4_sys_putmsg(struct lwp *l, const struct svr4_sys_putmsg_args *uap, register_t *retval)
+{
+...
+        if ((fp = fd_getfile(SCARG(uap, fd))) == NULL)
+                return EBADF;
+...
+         switch (st->s_cmd = sc.cmd) {
+        case SVR4_TI_CONNECT_REQUEST:   /* connect       */
+          KERNEL_UNLOCK_ONE(NULL);
+                return do_sys_connect(l, SCARG(uap, fd), nam); <-- not doing goto out; hence fd_putfile(SCARG(uap, fd)); is never called. if you trigger this 2**32 times, the refcount for fd will overflow and you end up with a dangling file descriptor 
+
+        case SVR4_TI_SENDTO_REQUEST:    /* sendto        */
+          KERNEL_UNLOCK_ONE(NULL);
+                msg.msg_name = nam;
+                msg.msg_namelen = sasize;
+                msg.msg_iov = &aiov;
+                msg.msg_iovlen = 1;
+                msg.msg_control = NULL;
+                msg.msg_flags = MSG_NAMEMBUF;
+                aiov.iov_base = NETBSD32PTR(dat.buf);
+                aiov.iov_len = dat.len;
+                error = do_sys_sendmsg(l, SCARG(uap, fd), &msg,
+                               SCARG(uap, flags), retval);
+
+                *retval = 0;
+                return error; <-- not doing goto out; hence fd_putfile(SCARG(uap, fd)); is never called. if you trigger this 2**32 times, the refcount for fd will overflow and you end up with a dangling file descriptor 
+  
+        default:
+                m_free(nam);
+                DPRINTF(("putmsg: Unimplemented command %lx\n", sc.cmd));
+                error = ENOSYS;
+                goto out;
+        }
+
+ out:
+         KERNEL_UNLOCK_ONE(NULL);
+         fd_putfile(SCARG(uap, fd));
+         return error;
+}
+
+---------------------------------------------------------------------------------------------
+unvalidated offset in svr4_sys_putmsg() for AF_LOCAL case 
+
+in the AF_LOCAL case for svr4_sys_putmsg() a svr4_strmcmd struct is copied from userland to kernel.
+this struct contains an offset that is used but never validated. which -if triggered- will cause 
+an out of bound read. this can info leak or cause a kernel panic. 
+
+usr\src\sys\compat\svr4\Svr4_stream.c
+
+int
+svr4_sys_putmsg(struct lwp *l, const struct svr4_sys_putmsg_args *uap, register_t *retval)
+{
+...
+        case AF_LOCAL:
+                if (ctl.len == 8) {
+...
+                }
+                else {
+                        /* Maybe we've been given a device/inode pair */
+                        dev_t *dev = SVR4_ADDROF(&sc); <-- offs not validated  
+                        svr4_ino_t *ino = (svr4_ino_t *) &dev[1];
+                        skp = svr4_find_socket(p, fp, *dev, *ino); <-- crash 
+...
+                }
+...
+}
+
+---------------------------------------------------------------------------------------------
+infoleak in ibcs2_sys_ioctl 
+
+ibcs2_sys_ioctl() is the ioctl syscall for the ibcs2 compat layer. when it handles the IBCS2_OXCGETA
+ioctl, it fills out a ibcs2_termios structure and then copies it to userland. There are several 
+elements inside that structure that don't get initialized. As such uninitialized stack data is copied 
+to userland. 
+
+usr\src\sys\compat\ibcs2\Ibcs2_ioctl.c
+
+int
+ibcs2_sys_ioctl(struct lwp *l, const struct ibcs2_sys_ioctl_args *uap, register_t *retval)
+{
+...
+        struct ibcs2_termios sts;
+...
+        switch ((unsigned long)SCARG(uap, cmd)) {
+...
+        case IBCS2_OXCGETA:
+                if ((error = (*ctl)(fp, TIOCGETA, &bts)) != 0)
+                        goto out;
+
+                btios2stios(&bts, &sts); <-- does not fill in all fields of sts !!! info leak !!! 
+...
+                if (SCARG(uap, cmd) == IBCS2_TCGETA) {
+...
+                } else
+                        error = copyout(&sts, SCARG(uap, data), sizeof(sts)); <-- leaks back to userland 
+                break;
+...
+}
+
+
+usr\src\sys\compat\ibcs2\Ibcs2_termios.h
+struct ibcs2_termios {
+        ibcs2_tcflag_t  c_iflag;
+        ibcs2_tcflag_t  c_oflag;
+        ibcs2_tcflag_t  c_cflag;
+        ibcs2_tcflag_t  c_lflag;
+        char            c_line;
+        ibcs2_cc_t      c_cc[IBCS2_NCCS]; <-- btios2stios() does not set some of these, specifically index 8 and index 9 
+        char            c_ispeed; <-- btios2stios() does not set this variable 
+        char            c_ospeed; <-- btios2stios() does not set this variable
+};
+
+---------------------------------------------------------------------------------------------
+
+potenial use of expired pointers in ibcs2_sys_statfs()/ibcs2_sys_statvfs()
+
+both are syscalls as part of the ibcs2 compat layer. both take a pathname as input and proceed to lookup the path using namei().
+on success namei() will increase the refcount for the vnode if the path that was looked up. After a successful call to namei() both 
+syscalls grab the mount pointer from the vnode and statvfs pointer from the mount pointer. After this, the vnode refcount is decreased. 
+
+at this point it seems possible that the filesystem the pathname was on could be unmounted (because of vnode refcount drop). as such, 
+the mount and statvfs pointers could be expired and any use of them would trigger a use after free. 
+
+usr\src\sys\compat\ibcs2\Ibcs2_stat.c
+int
+ibcs2_sys_statfs(struct lwp *l, const struct ibcs2_sys_statfs_args *uap, register_t *retval)
+{
+                /* {
+                                syscallarg(const char *) path;
+                                syscallarg(struct ibcs2_statfs *) buf;
+                                syscallarg(int) len;
+                                syscallarg(int) fstype;
+                } */
+                struct mount *mp;
+                struct statvfs *sp;
+                int error;
+                struct nameidata nd;
+
+                NDINIT(&nd, LOOKUP, FOLLOW | TRYEMULROOT, UIO_USERSPACE,
+                    SCARG(uap, path)); <-- lets say we’re the only person to ever touch any file (this file) on the fs it’s on.  nd.ni_vp gets recount 1 here ...
+                if ((error = namei(&nd)) != 0) <-- ... or here
+                                return (error);
+                mp = nd.ni_vp->v_mount;
+                sp = &mp->mnt_stat;
+                vrele(nd.ni_vp);  <-- refcount nd.vi_vp is decreased to 0. There are no files open on the fs it’s on. lets assume the file system unmounts right after this. 
+                if ((error = VFS_STATVFS(mp, sp)) != 0) <-- if the file system is unmounted, then mp and sp are now dangling pointers 
+                                return (error);
+                sp->f_flag = mp->mnt_flag & MNT_VISFLAGMASK;
+                return cvt_statfs(sp, (void *)SCARG(uap, buf), SCARG(uap, len));
+}
+
+same bug in: 
+
+int
+ibcs2_sys_statvfs(struct lwp *l, const struct ibcs2_sys_statvfs_args *uap, register_t *retval)
+{
+        /* {
+                syscallarg(const char *) path;
+                syscallarg(struct ibcs2_statvfs *) buf;
+        } */
+        struct mount *mp;
+        struct statvfs *sp;
+        int error;
+        struct nameidata nd;
+
+        NDINIT(&nd, LOOKUP, FOLLOW | TRYEMULROOT, UIO_USERSPACE,
+            SCARG(uap, path));
+        if ((error = namei(&nd)) != 0)
+                return (error);
+        mp = nd.ni_vp->v_mount;
+        sp = &mp->mnt_stat;
+        vrele(nd.ni_vp); <-- once this refcount is gone, mp and sp could be dangling pointers 
+        if ((error = VFS_STATVFS(mp, sp)) != 0)
+                return (error);
+        sp->f_flag = mp->mnt_flag & MNT_VISFLAGMASK;
+        return cvt_statvfs(sp, (void *)SCARG(uap, buf),
+                           sizeof(struct ibcs2_statvfs));
+}
+
+---------------------------------------------------------------------------------------------
+
+missing cred check in linux_sys_settimeofday()
+
+linux_sys_settimeofday() allows a caller to set the time value as well as the timezone for the linux compat subsystem. 
+this is a priviledges syscall. When setting the timeval a call is make to sys_settimeofday() which will do the priv check. 
+
+However, when setting the timezone, no such check occurs. There is a comment describing this logic, but the comment is wrong. 
+
+usr\src\sys\compat\linux\common\Linux_time.c
+int
+linux_sys_settimeofday(struct lwp *l, const struct linux_sys_settimeofday_args *uap, register_t *retval)
+{
+        /* {
+                syscallarg(struct timeval *) tp;
+                syscallarg(struct timezone *) tzp;
+        } */
+        int error = 0;
+
+        if (SCARG(uap, tp)) { <-- user can set tp to NULL 
+                error = sys_settimeofday(l, (const void *)uap, retval);
+                if (error)
+                        return (error);
+        }
+
+        /*
+         * If user is not the superuser, we returned
+         * after the sys_settimeofday() call. <-- NOT TRUE. if user didn't set tp, but set tzp, then you're hosed. needs a creds check here too ! 
+         */
+        if (SCARG(uap, tzp)) { <-- user can set tzp to a valid pointer 
+                error = copyin(SCARG(uap, tzp), &linux_sys_tz, sizeof(linux_sys_tz));
+                if (error)
+                        return (error);
+        }
+
+        return (0);
+}
+
+---------------------------------------------------------------------------------------------
+wrong error checking in bwi_newbuf() can cause an mbuf to delcare an mbuf length that is too big
+
+bwi_newbuf() calls MGETHDR() to create and initialize an mbuf. it then calls MCLGET() to create an
+mbuf cluster. After the call to MCLGET() there is an error check to see if it succeeded, by seeing 
+if the mbuf pointer is NULL. This is not how you check to see if MCLGET() succeeded (on failure 
+the mbuf will still be valid, but simply wont have a cluster). As such the current error checking is 
+moot and that if scope will never be reached. 
+
+netbsd\src\sys\dev\ic\Bwi.c 
+static int
+bwi_newbuf(struct bwi_softc *sc, int buf_idx, int init)
+{
+        struct bwi_rxbuf_data *rbd = &sc->sc_rx_bdata;
+        struct bwi_rxbuf *rxbuf = &rbd->rbd_buf[buf_idx];
+        struct bwi_rxbuf_hdr *hdr;
+        bus_dmamap_t map;
+        bus_addr_t paddr;
+        struct mbuf *m;
+        int error;
+
+        KASSERT(buf_idx < BWI_RX_NDESC);
+
+        MGETHDR(m, init ? M_WAITOK : M_DONTWAIT, MT_DATA);
+        if (m == NULL)
+                return (ENOBUFS);
+        MCLGET(m, init ? M_WAITOK : M_DONTWAIT);
+        if (m == NULL) {  <-- this is broken. if MCLGET() fails, m is still valid. need to check M_EXT instead! 
+                error = ENOBUFS;
+
+                /*
+                 * If the NIC is up and running, we need to:
+                 * - Clear RX buffer's header.
+                 * - Restore RX descriptor settings.
+                 */
+                if (init)
+                        return error;
+                else
+                        goto back;
+        }
+        m->m_len = m->m_pkthdr.len = MCLBYTES; <-- length will not be accurate in case MCLGET() failed. 
+...
+}
+
+
+---------------------------------------------------------------------------------------------
+missing mbuf cluster allocation error checking in dme_alloc_receive_buffer()
+
+dme_alloc_receive_buffer() is called by the driver to allocate an mbuf for ethernet frames.
+it calls MGETHDR() to allocate and initialize an mbuf. if the frame length is larger than MHLEN 
+it will call MCLGET() to allocate an mbuf cluster and then proceeds to set the mbuf length to the 
+frame length. 
+
+There is no error checking when calling MCLGET() (should check M_EXT). if it fails, the mbuf will
+still be valid, but not large enough. 
+
+netbsd\src\sys\dev\ic\Dm9000.c
+struct mbuf*
+dme_alloc_receive_buffer(struct ifnet *ifp, unsigned int frame_length)
+{
+        struct dme_softc *sc = ifp->if_softc;
+        struct mbuf *m;
+        int pad;
+
+        MGETHDR(m, M_DONTWAIT, MT_DATA);
+        m->m_pkthdr.rcvif = ifp;
+        /* Ensure that we always allocate an even number of
+         * bytes in order to avoid writing beyond the buffer
+         */
+        m->m_pkthdr.len = frame_length + (frame_length % sc->sc_data_width);
+        pad = ALIGN(sizeof(struct ether_header)) -
+                sizeof(struct ether_header);
+        /* All our frames have the CRC attached */
+        m->m_flags |= M_HASFCS;
+        if (m->m_pkthdr.len + pad > MHLEN )
+                MCLGET(m, M_DONTWAIT); <-- need to check M_EXT to see if this succeeded or not! 
+
+        m->m_data += pad;
+        m->m_len = frame_length + (frame_length % sc->sc_data_width); <-- if MCLGET() fails the mbuf will be smaller than reported length 
+
+        return m;
+}
+
+
+---------------------------------------------------------------------------------------------
+memory leak in sonic_rxintr() 
+
+if a call to MCLGET() fails in sonic_rxintr() the mbuf it previously allocated it not mfreem'ed. 
+
+netbsd\src\sys\dev\ic\Dp83932.c 
+void
+sonic_rxintr(struct sonic_softc *sc)
+{
+        struct ifnet *ifp = &sc->sc_ethercom.ec_if;
+        struct sonic_descsoft *ds;
+        struct sonic_rda32 *rda32;
+        struct sonic_rda16 *rda16;
+        struct mbuf *m;
+        int i, len;
+        uint16_t status, bytecount /*, ptr0, ptr1, seqno */;
+
+        for (i = sc->sc_rxptr;; i = SONIC_NEXTRX(i)) {
+...
+                if (sc->sc_32bit) {
+                        MGETHDR(m, M_DONTWAIT, MT_DATA);
+                        if (m == NULL)
+                                goto dropit;
+                        if (len > (MHLEN - 2)) {
+                                MCLGET(m, M_DONTWAIT);
+                                if ((m->m_flags & M_EXT) == 0)
+                                        goto dropit; <-- need to mfreem(m) before doing this 
+                        }
+...
+                } ...
+...
+ dropit:  <-- will not mfreem(m)
+                                ifp->if_ierrors++;
+                                SONIC_INIT_RXDESC(sc, i);
+                                bus_dmamap_sync(sc->sc_dmat, ds->ds_dmamap, 0,
+                                    ds->ds_dmamap->dm_mapsize,
+                                    BUS_DMASYNC_PREREAD);
+                                continue;
+...
+        }
+...
+}
+
+
+---------------------------------------------------------------------------------------------
+potential double free in iee_init()/iee_stop()
+
+iee_init() creates mbufs and mbuf clusters and stores them in the driver specific software context.
+if the mbuf cluster allocation fails, the mbuf is free'd but the mbuf pointer is still in driver 
+specific software context. when the interface is destroyed, and the stop routine is called, it loops
+over all mbufs in the driver specific software context and free's those that are there. effectively 
+causing a double free. 
+
+netbsd\src\sys\dev\ic\I82596.c 
+int
+iee_init(struct ifnet *ifp)
+{
+...
+                        MCLGET(sc->sc_rx_mbuf[r], M_DONTWAIT);
+                        if ((sc->sc_rx_mbuf[r]->m_flags & M_EXT) == 0) {
+                                printf("%s: iee_init: can't allocate mbuf"
+                                    " cluster\n", device_xname(sc->sc_dev));
+                                m_freem(sc->sc_rx_mbuf[r]); <-- need to set this to NULL 
+                                err = 1;
+                                break;
+                        }
+...
+}
+
+
+void
+iee_stop(struct ifnet *ifp, int disable)
+{
+        struct iee_softc *sc = ifp->if_softc;
+        int n;
+
+        ifp->if_flags &= ~IFF_RUNNING;
+        ifp->if_flags |= IFF_OACTIVE;
+        ifp->if_timer = 0;
+        /* Reset the chip to get it quiet. */
+        (sc->sc_iee_reset)(ifp->if_softc);
+        /* Issue a Channel Attention to ACK interrupts we may have caused. */
+        (sc->sc_iee_cmd)(ifp->if_softc, IEE_SCB_ACK);
+        /* Release any dynamically allocated resources. */
+        for (n = 0 ; n < IEE_NCB ; n++) {
+                if (sc->sc_tx_map[n] != NULL)
+                        bus_dmamap_destroy(sc->sc_dmat, sc->sc_tx_map[n]);
+                sc->sc_tx_map[n] = NULL;
+        }
+        for (n = 0 ; n < IEE_NRFD ; n++) {
+                if (sc->sc_rx_mbuf[n] != NULL)
+                        m_freem(sc->sc_rx_mbuf[n]); <-- could double free here 
+                sc->sc_rx_mbuf[n] = NULL;
+                if (sc->sc_rx_map[n] != NULL) {
+                        bus_dmamap_unload(sc->sc_dmat, sc->sc_rx_map[n]);
+                        bus_dmamap_destroy(sc->sc_dmat, sc->sc_rx_map[n]);
+                }
+                sc->sc_rx_map[n] = NULL;
+        }
+}
+
+---------------------------------------------------------------------------------------------
+missing mbuf cluster allocation error checking in et_newbuf()
+
+et_newbuf() is called by the driver to allocate an mbuf. It calls MGETHDR() to allocate and initialize an mbuf. 
+if the length is larger than MINCLSIZE it will call MCLGET() to allocate an mbuf cluster and then proceeds to 
+set the mbuf length to the frame length. 
+
+There is no error checking when calling MCLGET() (should check M_EXT). if it fails, the mbuf will
+still be valid, but not large enough. 
+
+netbsd\src\sys\dev\pci\If_et.c 
+
+int
+et_newbuf(struct et_rxbuf_data *rbd, int buf_idx, int init, int len0)
+{
+        struct et_softc *sc = rbd->rbd_softc;
+        struct et_rxdesc_ring *rx_ring;
+        struct et_rxdesc *desc;
+        struct et_rxbuf *rb;
+        struct mbuf *m;
+        bus_dmamap_t dmap;
+        int error, len;
+
+        KASSERT(buf_idx < ET_RX_NDESC);
+        rb = &rbd->rbd_buf[buf_idx];
+
+        if (len0 >= MINCLSIZE) {
+                MGETHDR(m, init ? M_WAITOK : M_DONTWAIT, MT_DATA);
+                if (m == NULL)
+                        return (ENOBUFS);
+                MCLGET(m, init ? M_WAITOK : M_DONTWAIT); <-- need to check M_EXT to see if this succeeded or not! 
+                len = MCLBYTES; <-- len could be wrong if MCLGET() failed 
+...
+}
+
+
+
+---------------------------------------------------------------------------------------------
+double free in ipw_dma_alloc()
+
+ipw_dma_alloc() allocates an mbuf and dma map and stores them in the driver specific software context. if an error 
+occurs, the mbuf and dma map gets destroyed, but the pointers are still in the driver specific software context.
+later on, a call to ipw_release(sc) occurs. This function will destroy the dma map and mbuf again. 
+
+
+netbsd\src\sys\dev\pci\If_ipw.c 
+
+static int
+ipw_dma_alloc(struct ipw_softc *sc)
+{
+        struct ipw_soft_bd *sbd;
+        struct ipw_soft_hdr *shdr;
+        struct ipw_soft_buf *sbuf;
+        int error, i, nsegs;
+...
+        /*
+         * Pre-allocate rx buffers and DMA maps
+         */
+        for (i = 0; i < IPW_NRBD; i++) {
+...
+                MGETHDR(sbuf->m, M_DONTWAIT, MT_DATA);
+...
+                MCLGET(sbuf->m, M_DONTWAIT);
+...
+                error = bus_dmamap_create(sc->sc_dmat, MCLBYTES, 1, MCLBYTES,
+                    0, BUS_DMA_NOWAIT | BUS_DMA_ALLOCNOW, &sbuf->map);
+...
+                error = bus_dmamap_load_mbuf(sc->sc_dmat, sbuf->map,
+                    sbuf->m, BUS_DMA_READ | BUS_DMA_NOWAIT);
+                if (error != 0) {
+                        bus_dmamap_destroy(sc->sc_dmat, sbuf->map); <-- need to set sbuf->map to NULL before calling goto fail
+                        m_freem(sbuf->m);
+                        aprint_error_dev(sc->sc_dev, "could not map rxbuf dma memory\n");
+                        goto fail;
+                }
+...
+        }
+...
+fail:   ipw_release(sc);
+        return error;
+}
+
+static void
+ipw_release(struct ipw_softc *sc)
+{
+        struct ipw_soft_buf *sbuf;
+        int i;
+...
+        for (i = 0; i < IPW_NRBD; i++) {
+                sbuf = &sc->rx_sbuf_list[i];
+                if (sbuf->map != NULL) {
+                        if (sbuf->m != NULL) { <-- if there was an error (see above) and sbuf map and m are not NULL, there is the posibility of a double free right here 
+                                bus_dmamap_unload(sc->sc_dmat, sbuf->map);
+                                m_freem(sbuf->m);
+                        }
+                        bus_dmamap_destroy(sc->sc_dmat, sbuf->map); <-- double map destroy
+                }
+        }
+
+}
+---------------------------------------------------------------------------------------------
+memory leak in netdock_get()
+
+netdock_get() allocates an mbuf and creates an mbuf cluster if needed. if the cluster allocation 
+fails the function returns without mfreem()'ing the mbuf, essentally leaking the mbuf. 
+
+netbsd\src\sys\arch\mac68k\nubus\If_netdock_nubus.c 
+static struct mbuf *
+netdock_get(struct netdock_softc *sc, int datalen)
+{
+        struct mbuf *m, *top, **mp;
+...
+        MGETHDR(m, M_DONTWAIT, MT_DATA);
+        if (m == NULL)
+                return (NULL);
+        m->m_pkthdr.rcvif = &sc->sc_if;
+        m->m_pkthdr.len = datalen;
+        len = MHLEN;
+        top = NULL;
+        mp = &top;
+
+        while (datalen > 0) {
+                if (top) {
+                        MGET(m, M_DONTWAIT, MT_DATA);
+                        if (m == 0) {
+                                m_freem(top);
+                                return (NULL);
+                        }
+                        len = MLEN;
+                }
+                if (datalen >= MINCLSIZE) {
+                        MCLGET(m, M_DONTWAIT);
+                        if ((m->m_flags & M_EXT) == 0) {
+                                if (top)
+                                        m_freem(top);
+                                return (NULL); <-- memory leak. need to mfreem(m) before doing this. 
+                        }
+                        len = MCLBYTES;
+                }
+...
+        }
+
+        return (top);
+}
+
+
+
+
+---------------------------------------------------------------------------------------------
+memory leak in sonic_get()
+
+sonic_get() allocates an mbuf and creates an mbuf cluster if needed. if the cluster allocation 
+fails the function returns without mfreem()'ing the mbuf, essentally leaking the mbuf. 
+
+
+netbsd\src\sys\arch\newsmips\apbus\If_sn.c 
+static inline struct mbuf *
+sonic_get(struct sn_softc *sc, void *pkt, int datalen)
+{
+        struct  mbuf *m, *top, **mp;
+        int     len;
+
+        MGETHDR(m, M_DONTWAIT, MT_DATA);
+        if (m == 0)
+                return 0;
+        m->m_pkthdr.rcvif = &sc->sc_if;
+        m->m_pkthdr.len = datalen;
+        len = MHLEN;
+        top = 0;
+        mp = &top;
+
+        while (datalen > 0) {
+                if (top) {
+                        MGET(m, M_DONTWAIT, MT_DATA);
+                        if (m == 0) {
+                                m_freem(top);
+                                return 0;
+                        }
+                        len = MLEN;
+                }
+                if (datalen >= MINCLSIZE) {
+                        MCLGET(m, M_DONTWAIT);
+                        if ((m->m_flags & M_EXT) == 0) {
+                                if (top) m_freem(top);
+                                return 0; <-- memory leak. need to mfreem(m) before doing this.
+                        }
+                        len = MCLBYTES;
+                }
+...
+        }
+
+        return top;
+}
+
+
+
+
+---------------------------------------------------------------------------------------------
+ural_alloc_rx_list() calls wrong destructor in case of failure
+
+
+ural_alloc_rx_list() sets up a usb transfer and creates an mbuf and mbuf cluster. on failure
+it calls a destructor. this should be ural_free_rx_list() but it actually calls ural_free_tx_list()!
+
+netbsd\src\sys\dev\usb\If_ural.c
+Static int
+ural_alloc_rx_list(struct ural_softc *sc)
+{
+        struct ural_rx_data *data;
+        int i, error;
+...
+fail:   ural_free_tx_list(sc);  <-- calling the wrong destructor!!! need to call ural_free_!!!!rx!!!!_list(), not tx!!!
+        return error;
+}
+
